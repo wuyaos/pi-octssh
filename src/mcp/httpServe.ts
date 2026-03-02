@@ -156,14 +156,20 @@ export type ServeConfig = {
 };
 
 export async function runStreamableHttpServer(params: {
-  server: McpServer;
   config: ServeConfig;
+  server?: McpServer;
+  createServer?: () => McpServer;
 }) {
+  if (!params.createServer && !params.server) {
+    throw new Error("runStreamableHttpServer: missing server (pass server or createServer)");
+  }
+  const createServer = params.createServer ?? (() => params.server!);
   const authKey =
     params.config.authKey ?? crypto.randomBytes(24).toString("base64url");
 
-  // Map of active transports per session.
-  const transports: Record<string, StreamableHTTPServerTransport> = {};
+  const sessions: Record<string, { transport: StreamableHTTPServerTransport; server: McpServer }> = {};
+  const multiSession = !!params.createServer;
+  let singleSessionActive = false;
 
   const httpServer = http.createServer(async (req, res) => {
     let stage = "start";
@@ -199,25 +205,35 @@ export async function runStreamableHttpServer(params: {
         let transport: StreamableHTTPServerTransport | undefined;
 
         stage = "select_transport";
-        if (sessionId && transports[sessionId]) {
-          transport = transports[sessionId];
+        if (sessionId && sessions[sessionId]) {
+          transport = sessions[sessionId].transport;
         } else if (!sessionId && body && isInitializeRequest(body)) {
+          if (!multiSession && singleSessionActive) {
+            res.statusCode = 409;
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify({ error: "Only one session is supported with a single server instance" }));
+            return;
+          }
+
           stage = "init_transport";
+          const server = createServer();
           const eventStore = new InMemoryEventStore();
           transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => crypto.randomUUID(),
             eventStore,
             onsessioninitialized: (sid) => {
-              transports[sid] = transport!;
+              sessions[sid] = { transport: transport!, server };
             },
           });
           transport.onclose = () => {
             const sid = transport!.sessionId;
-            if (sid && transports[sid]) delete transports[sid];
+            if (sid && sessions[sid]) delete sessions[sid];
+            if (!multiSession) singleSessionActive = false;
           };
 
           stage = "connect";
-          await params.server.connect(transport);
+          await server.connect(transport);
+          if (!multiSession) singleSessionActive = true;
 
           stage = "handle_post_init";
           await transport.handleRequest(req, res, body);
@@ -238,12 +254,12 @@ export async function runStreamableHttpServer(params: {
           return methodNotAllowed(res, "SSE stream not available before session initialization");
         }
 
-        if (!sessionId || !transports[sessionId]) {
+        if (!sessionId || !sessions[sessionId]) {
           return badRequest(res, "Invalid or missing session ID");
         }
 
         stage = "handle_get_delete";
-        await transports[sessionId].handleRequest(req, res);
+        await sessions[sessionId].transport.handleRequest(req, res);
         return;
       }
 
@@ -277,14 +293,15 @@ export async function runStreamableHttpServer(params: {
     url: baseUrl,
     authKey,
     close: async () => {
-      for (const sid of Object.keys(transports)) {
+      for (const sid of Object.keys(sessions)) {
         try {
-          await transports[sid].close();
+          await sessions[sid].transport.close();
         } catch {
           // ignore
         }
-        delete transports[sid];
+        delete sessions[sid];
       }
+      singleSessionActive = false;
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     },
   };

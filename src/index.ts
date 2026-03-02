@@ -30,9 +30,8 @@ async function main() {
 
     // `serve` is intended to be installed on the target machine and expose
     // tools that operate on *this* machine (no outbound SSH connections).
-    const server = createOctsshLocalServer();
     const { url, authKey: effectiveKey, close } = await runStreamableHttpServer({
-      server,
+      createServer: createOctsshLocalServer,
       config: {
         host,
         port,

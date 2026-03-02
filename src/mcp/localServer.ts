@@ -41,9 +41,11 @@ function tailLocalFile(filePath: string, lines: number) {
   }
 }
 
-export function createOctsshLocalServer() {
-  const cfg = loadConfig(getOctsshDir());
-  const server = new McpServer({ name: "octssh", version: "0.0.0" });
+let localCleanupStarted = false;
+
+function ensureLocalCleanupStarted() {
+  if (localCleanupStarted) return;
+  localCleanupStarted = true;
 
   // TTL cleanup for local async sessions.
   // Keep it best-effort and lightweight; this runs in a long-lived serve process.
@@ -72,6 +74,13 @@ export function createOctsshLocalServer() {
       // ignore cleanup errors
     }
   }, 60 * 60 * 1000).unref();
+}
+
+export function createOctsshLocalServer() {
+  const cfg = loadConfig(getOctsshDir());
+  const server = new McpServer({ name: "octssh", version: "0.0.0" });
+
+  ensureLocalCleanupStarted();
 
   server.registerTool(
     "list",

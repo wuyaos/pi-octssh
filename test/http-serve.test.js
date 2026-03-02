@@ -7,10 +7,8 @@ const { StreamableHTTPClientTransport } = require('@modelcontextprotocol/sdk/cli
 test('Streamable HTTP serve requires auth header', async () => {
   const { createOctsshLocalServer } = require('../dist/mcp/localServer.js');
   const { runStreamableHttpServer } = require('../dist/mcp/httpServe.js');
-
-  const server = createOctsshLocalServer();
   const started = await runStreamableHttpServer({
-    server,
+    createServer: createOctsshLocalServer,
     config: { host: '127.0.0.1', port: 0, authKey: 'test-key' }
   });
 
@@ -67,6 +65,42 @@ test('Streamable HTTP serve requires auth header', async () => {
 
       await transport.close();
     }
+  } finally {
+    await started.close();
+  }
+});
+
+test('Streamable HTTP serve supports multiple sessions', async () => {
+  const { createOctsshLocalServer } = require('../dist/mcp/localServer.js');
+  const { runStreamableHttpServer } = require('../dist/mcp/httpServe.js');
+
+  const started = await runStreamableHttpServer({
+    createServer: createOctsshLocalServer,
+    config: { host: '127.0.0.1', port: 0, authKey: 'test-key' }
+  });
+
+  async function connectAndClose() {
+    const transport = new StreamableHTTPClientTransport(new URL(started.url), {
+      requestInit: {
+        headers: {
+          'x-octssh-key': 'test-key'
+        }
+      }
+    });
+    const client = new Client({ name: 'octssh-http-test', version: '0.0.0' }, { capabilities: {} });
+    try {
+      await client.connect(transport);
+      const tools = await client.listTools();
+      assert.ok(Array.isArray(tools.tools));
+      assert.ok(tools.tools.find((t) => t.name === 'list'));
+    } finally {
+      try { await transport.close(); } catch {}
+    }
+  }
+
+  try {
+    await connectAndClose();
+    await connectAndClose();
   } finally {
     await started.close();
   }
