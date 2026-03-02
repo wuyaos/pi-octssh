@@ -110,6 +110,45 @@ function getBearer(req: http.IncomingMessage) {
   return m?.[1];
 }
 
+function shouldDebug() {
+  const v = process.env.OCTSSH_SERVE_DEBUG ?? process.env.OCTSSH_DEBUG;
+  return v === "1" || v === "true";
+}
+
+function toSingleHeaderValue(v: string | string[] | undefined) {
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) return v[0];
+  return undefined;
+}
+
+function safeRequestMeta(req: http.IncomingMessage) {
+  const sessionId = toSingleHeaderValue(req.headers["mcp-session-id"]);
+
+  return {
+    method: (req.method ?? "GET").toUpperCase(),
+    url: req.url ?? "",
+    host: toSingleHeaderValue(req.headers.host),
+    sessionId,
+    userAgent: toSingleHeaderValue(req.headers["user-agent"]),
+  };
+}
+
+function logServeError(message: string, err: unknown, meta: Record<string, unknown>) {
+  type ErrorLike = { message?: unknown; stack?: unknown };
+  const stack = (() => {
+    if (err instanceof Error) return err.stack ?? err.message;
+    if (typeof err === "object" && err !== null) {
+      const e = err as ErrorLike;
+      if (typeof e.stack === "string") return e.stack;
+      if (typeof e.message === "string") return e.message;
+    }
+    return String(err);
+  })();
+  console.error("[octssh serve]", message);
+  console.error("[octssh serve]", JSON.stringify(meta));
+  console.error("[octssh serve]", stack);
+}
+
 export type ServeConfig = {
   host: string;
   port: number;
@@ -127,21 +166,29 @@ export async function runStreamableHttpServer(params: {
   const transports: Record<string, StreamableHTTPServerTransport> = {};
 
   const httpServer = http.createServer(async (req, res) => {
+    let stage = "start";
+    const debug = shouldDebug();
+    const meta = safeRequestMeta(req);
+
     try {
-      const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+      stage = "parse_url";
+      const url = new URL(req.url ?? "/", "http://octssh.local");
       if (url.pathname !== "/mcp") return notFound(res);
 
+      stage = "auth";
       const provided = getAuthHeader(req) ?? getBearer(req);
       if (!provided || provided !== authKey) {
         return unauthorized(res, "Missing or invalid OctSSH auth key");
       }
 
+      stage = "route";
       const method = (req.method ?? "GET").toUpperCase();
       const sidHeader = req.headers["mcp-session-id"];
       const sessionId =
         typeof sidHeader === "string" ? sidHeader : Array.isArray(sidHeader) ? sidHeader[0] : undefined;
 
       if (method === "POST") {
+        stage = "read_body";
         let body: any;
         try {
           body = await readJsonBody(req);
@@ -151,9 +198,11 @@ export async function runStreamableHttpServer(params: {
 
         let transport: StreamableHTTPServerTransport | undefined;
 
+        stage = "select_transport";
         if (sessionId && transports[sessionId]) {
           transport = transports[sessionId];
-        } else if (!sessionId && isInitializeRequest(body)) {
+        } else if (!sessionId && body && isInitializeRequest(body)) {
+          stage = "init_transport";
           const eventStore = new InMemoryEventStore();
           transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => crypto.randomUUID(),
@@ -167,13 +216,17 @@ export async function runStreamableHttpServer(params: {
             if (sid && transports[sid]) delete transports[sid];
           };
 
+          stage = "connect";
           await params.server.connect(transport);
+
+          stage = "handle_post_init";
           await transport.handleRequest(req, res, body);
           return;
         } else {
           return badRequest(res, "Bad Request: missing session ID or not an initialize request");
         }
 
+        stage = "handle_post";
         await transport.handleRequest(req, res, body);
         return;
       }
@@ -188,12 +241,20 @@ export async function runStreamableHttpServer(params: {
         if (!sessionId || !transports[sessionId]) {
           return badRequest(res, "Invalid or missing session ID");
         }
+
+        stage = "handle_get_delete";
         await transports[sessionId].handleRequest(req, res);
         return;
       }
 
       return methodNotAllowed(res);
     } catch (err) {
+      if (debug) {
+        logServeError("request failed", err, { stage, ...meta });
+      } else {
+        logServeError("request failed", err, { stage, method: meta.method, url: meta.url, sessionId: meta.sessionId });
+      }
+
       // Best-effort error.
       if (!res.headersSent) {
         res.statusCode = 500;
