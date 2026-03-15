@@ -1,11 +1,11 @@
 {
   "name": "@aliyahzombie/octssh",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "OctSSH - Make LLMs safely control your servers for deployment (MCP)",
   "license": "UNLICENSED",
   "repository": {
     "type": "git",
-    "url": "https://github.com/aliyahzombie/OctSSH.git"
+    "url": "git+https://github.com/aliyahzombie/OctSSH.git"
   },
   "homepage": "https://github.com/aliyahzombie/OctSSH#readme",
   "bugs": {
