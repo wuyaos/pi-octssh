@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -45,6 +46,10 @@ function normalizeToolPrefix(raw: string | undefined) {
   const v = (raw ?? "").trim();
   if (!v) return "";
   return v.endsWith("_") ? v : `${v}_`;
+}
+
+function sleepMs(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
 let localCleanupStarted = false;
@@ -305,6 +310,16 @@ export function createOctsshLocalServer() {
         return respond({ ok: false, tool: "write-stdin", error: "session is not a local async session" });
       }
 
+      const baseDir = getOctsshDir();
+      const expectedRunDir = path.join(baseDir, "runs", rec.session_id);
+      if (path.resolve(rec.runDir) !== path.resolve(expectedRunDir)) {
+        return respond({
+          ok: false,
+          tool: "write-stdin",
+          error: "invalid session runDir",
+        });
+      }
+
       const stdinPath = rec.stdinPath;
       const stdinLogPath = rec.stdinLogPath;
       const metaPath = rec.metaPath;
@@ -316,6 +331,38 @@ export function createOctsshLocalServer() {
           error:
             "stdin is not available for this session (created by older OctSSH version?). Start a new exec-async session.",
         });
+      }
+
+      const expectedStdinPath = path.join(expectedRunDir, "stdin.fifo");
+      const expectedStdinLogPath = path.join(expectedRunDir, "stdin.log");
+      if (path.resolve(stdinPath) !== path.resolve(expectedStdinPath)) {
+        return respond({ ok: false, tool: "write-stdin", error: "invalid stdinPath" });
+      }
+      if (path.resolve(stdinLogPath) !== path.resolve(expectedStdinLogPath)) {
+        return respond({ ok: false, tool: "write-stdin", error: "invalid stdinLogPath" });
+      }
+
+      try {
+        const st = fs.lstatSync(stdinPath);
+        if (st.isSymbolicLink()) {
+          return respond({ ok: false, tool: "write-stdin", error: "stdinPath must not be a symlink" });
+        }
+        if (!st.isFIFO()) {
+          return respond({ ok: false, tool: "write-stdin", error: "stdinPath is not a FIFO" });
+        }
+      } catch (err: any) {
+        return respond({ ok: false, tool: "write-stdin", error: String(err?.message ?? err) });
+      }
+
+      try {
+        const stLog = fs.lstatSync(stdinLogPath);
+        if (stLog.isSymbolicLink()) {
+          return respond({ ok: false, tool: "write-stdin", error: "stdinLogPath must not be a symlink" });
+        }
+      } catch (err: any) {
+        if (String(err?.code ?? "") !== "ENOENT") {
+          return respond({ ok: false, tool: "write-stdin", error: String(err?.message ?? err) });
+        }
       }
 
       let meta: any = null;
@@ -368,18 +415,38 @@ export function createOctsshLocalServer() {
         return respond({ ok: false, tool: "write-stdin", error: String(err?.message ?? err) });
       }
 
-      try {
-        const fd = fs.openSync(
-          stdinPath,
-          fs.constants.O_WRONLY | fs.constants.O_NONBLOCK
-        );
+      const startedAt = Date.now();
+      while (true) {
         try {
-          fs.writeSync(fd, buf);
-        } finally {
-          fs.closeSync(fd);
+          const fd = fs.openSync(stdinPath, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+          try {
+            let off = 0;
+            while (off < buf.length) {
+              const n = fs.writeSync(fd, buf, off, buf.length - off);
+              if (!Number.isFinite(n) || n <= 0) {
+                throw new Error("failed to write to stdin FIFO");
+              }
+              off += n;
+            }
+          } finally {
+            fs.closeSync(fd);
+          }
+          break;
+        } catch (err: any) {
+          const code = String(err?.code ?? "");
+          if (code === "EAGAIN") {
+            if (Date.now() - startedAt > 1500) {
+              return respond({
+                ok: false,
+                tool: "write-stdin",
+                error: "stdin FIFO backpressure (try again later)",
+              });
+            }
+            await sleepMs(25);
+            continue;
+          }
+          return respond({ ok: false, tool: "write-stdin", error: String(err?.message ?? err) });
         }
-      } catch (err: any) {
-        return respond({ ok: false, tool: "write-stdin", error: String(err?.message ?? err) });
       }
 
       return respond({

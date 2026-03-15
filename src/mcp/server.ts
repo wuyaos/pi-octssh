@@ -947,6 +947,28 @@ export function createOctsshServer() {
         });
       }
 
+      const stdinPath = rec.stdinPath;
+      const stdinLogPath = rec.stdinLogPath;
+      if (!stdinPath || !stdinLogPath) {
+        return respond({
+          ok: false,
+          tool: "write-stdin",
+          error:
+            "stdin is not available for this session (created by older OctSSH version?). Start a new exec-async session.",
+        });
+      }
+
+      const expectedRemoteDir = `.octssh/runs/${rec.session_id}`;
+      if (rec.remoteDir !== expectedRemoteDir) {
+        return respond({ ok: false, tool: "write-stdin", error: "invalid session remoteDir" });
+      }
+      if (stdinPath !== `${rec.remoteDir}/stdin.fifo`) {
+        return respond({ ok: false, tool: "write-stdin", error: "invalid stdinPath" });
+      }
+      if (stdinLogPath !== `${rec.remoteDir}/stdin.log`) {
+        return respond({ ok: false, tool: "write-stdin", error: "invalid stdinLogPath" });
+      }
+
       const wantNewline = append_newline ?? true;
       const payload = wantNewline ? `${data}\n` : data;
       const buf = Buffer.from(payload, "utf8");
@@ -1001,17 +1023,6 @@ export function createOctsshServer() {
           });
         }
 
-        const stdinPath = rec.stdinPath;
-        const stdinLogPath = rec.stdinLogPath;
-        if (!stdinPath || !stdinLogPath) {
-          return respond({
-            ok: false,
-            tool: "write-stdin",
-            error:
-              "stdin is not available for this session (created by older OctSSH version?). Start a new exec-async session.",
-          });
-        }
-
         const b64 = buf.toString("base64");
         const runDir = rec.remoteDir;
 
@@ -1022,6 +1033,9 @@ export function createOctsshServer() {
             `chunk=\"$run/stdin.chunk.$$\"`,
             `stdin=\"${toHomeAbs(stdinPath)}\"`,
             `stdinlog=\"${toHomeAbs(stdinLogPath)}\"`,
+            `test -p \"$stdin\" || { echo "stdin is not a fifo" >&2; exit 1; }`,
+            `test ! -L \"$stdin\" || { echo "stdin is a symlink" >&2; exit 1; }`,
+            `test ! -L \"$stdinlog\" || { echo "stdin log is a symlink" >&2; exit 1; }`,
             `printf %s ${quoteForSh(b64)} | base64 -d > \"$chunk\"`,
             `cat \"$chunk\" >> \"$stdinlog\" 2>/dev/null || true`,
             `(cat \"$chunk\" > \"$stdin\") & wpid=$!`,
