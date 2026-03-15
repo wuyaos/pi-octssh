@@ -105,3 +105,75 @@ test('Streamable HTTP serve supports multiple sessions', async () => {
     await started.close();
   }
 });
+
+test('Streamable HTTP serve supports write-stdin for async sessions', async () => {
+  const { createOctsshLocalServer } = require('../dist/mcp/localServer.js');
+  const { runStreamableHttpServer } = require('../dist/mcp/httpServe.js');
+
+  const started = await runStreamableHttpServer({
+    createServer: createOctsshLocalServer,
+    config: { host: '127.0.0.1', port: 0, authKey: 'test-key' }
+  });
+
+  const transport = new StreamableHTTPClientTransport(new URL(started.url), {
+    requestInit: {
+      headers: {
+        'x-octssh-key': 'test-key'
+      }
+    }
+  });
+  const client = new Client({ name: 'octssh-http-test', version: '0.0.0' }, { capabilities: {} });
+
+  const parse = (res) =>
+    res.structuredContent ||
+    (res.content && res.content[0] && res.content[0].type === 'text'
+      ? JSON.parse(res.content[0].text)
+      : null);
+
+  try {
+    await client.connect(transport);
+
+    const execAsyncRes = await client.callTool({
+      name: 'exec-async',
+      arguments: {
+        command: 'read -r line; echo got:$line; sleep 0.05'
+      }
+    });
+    const execAsyncParsed = parse(execAsyncRes);
+    assert.ok(execAsyncParsed);
+    assert.equal(execAsyncParsed.ok, true);
+    assert.equal(execAsyncParsed.tool, 'exec-async');
+    assert.ok(execAsyncParsed.data);
+    assert.ok(execAsyncParsed.data.session_id);
+
+    const sid = execAsyncParsed.data.session_id;
+    const writeRes = await client.callTool({
+      name: 'write-stdin',
+      arguments: { session_id: sid, data: 'hello-stdin', append_newline: true }
+    });
+    const writeParsed = parse(writeRes);
+    assert.ok(writeParsed);
+    assert.equal(writeParsed.ok, true);
+    assert.equal(writeParsed.tool, 'write-stdin');
+
+    let last = null;
+    for (let i = 0; i < 30; i++) {
+      const r = await client.callTool({
+        name: 'get-result',
+        arguments: { session_id: sid, lines: 50 }
+      });
+      last = parse(r);
+      if (last && last.ok && last.data && last.data.status !== 'running') break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    assert.ok(last);
+    assert.equal(last.ok, true);
+    assert.ok(last.data);
+    assert.ok(last.data.tails);
+    assert.ok(String(last.data.tails.stdout).includes('got:hello-stdin'));
+  } finally {
+    try { await transport.close(); } catch {}
+    await started.close();
+  }
+});

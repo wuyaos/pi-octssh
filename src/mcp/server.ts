@@ -68,6 +68,12 @@ function toHomeAbs(remotePath: string) {
   return p;
 }
 
+function normalizeToolPrefix(raw: string | undefined) {
+  const v = (raw ?? "").trim();
+  if (!v) return "";
+  return v.endsWith("_") ? v : `${v}_`;
+}
+
 export function createOctsshServer() {
   const cfg = loadConfig(getOctsshDir());
 
@@ -156,8 +162,11 @@ export function createOctsshServer() {
     version: "0.0.0",
   });
 
+  const toolPrefix = normalizeToolPrefix(process.env.OCTSSH_TOOL_PREFIX);
+  const toolName = (name: string) => `${toolPrefix}${name}`;
+
   server.registerTool(
-    "list",
+    toolName("list"),
     {
       title: "List SSH Hosts",
       description:
@@ -192,7 +201,7 @@ export function createOctsshServer() {
   );
 
   server.registerTool(
-    "info",
+    toolName("info"),
     {
       title: "Machine Info",
       description:
@@ -238,7 +247,7 @@ export function createOctsshServer() {
   );
 
   server.registerTool(
-    "exec",
+    toolName("exec"),
     {
       title: "Execute Command",
       description: "Execute a command on a machine (no sudo).",
@@ -298,7 +307,7 @@ export function createOctsshServer() {
   );
 
   server.registerTool(
-    "sudo-exec",
+    toolName("sudo-exec"),
     {
       title: "Execute Command (sudo)",
       description:
@@ -365,7 +374,7 @@ export function createOctsshServer() {
   );
 
   server.registerTool(
-    "exec-async",
+    toolName("exec-async"),
     {
       title: "Execute Async",
       description:
@@ -419,7 +428,7 @@ export function createOctsshServer() {
   );
 
   server.registerTool(
-    "exec-async-sudo",
+    toolName("exec-async-sudo"),
     {
       title: "Execute Async (sudo)",
       description:
@@ -473,7 +482,7 @@ export function createOctsshServer() {
   );
 
   server.registerTool(
-    "upload",
+    toolName("upload"),
     {
       title: "Upload Files/Directory",
       description:
@@ -552,7 +561,7 @@ export function createOctsshServer() {
   );
 
   server.registerTool(
-    "download",
+    toolName("download"),
     {
       title: "Download Files/Directory",
       description:
@@ -589,7 +598,7 @@ export function createOctsshServer() {
   );
 
   server.registerTool(
-    "upload-async",
+    toolName("upload-async"),
     {
       title: "Upload Async",
       description:
@@ -672,7 +681,7 @@ export function createOctsshServer() {
   );
 
   server.registerTool(
-    "download-async",
+    toolName("download-async"),
     {
       title: "Download Async",
       description:
@@ -715,7 +724,7 @@ export function createOctsshServer() {
   );
 
   server.registerTool(
-    "get-result",
+    toolName("get-result"),
     {
       title: "Get Async Result",
       description:
@@ -845,7 +854,7 @@ export function createOctsshServer() {
   );
 
   server.registerTool(
-    "grep-result",
+    toolName("grep-result"),
     {
       title: "Search Async Logs",
       description: "Search async stdout/stderr logs by pattern.",
@@ -905,7 +914,155 @@ export function createOctsshServer() {
   );
 
   server.registerTool(
-    "cancel",
+    toolName("write-stdin"),
+    {
+      title: "Write to Async stdin",
+      description:
+        "Write data to a running async session stdin. Works for exec-async sessions (remote screen).",
+      inputSchema: z.object({
+        session_id: z.string().min(1),
+        data: z.string(),
+        append_newline: z.boolean().optional(),
+      }),
+    },
+    async ({ session_id, data, append_newline }) => {
+      const rec = loadSession(session_id, getOctsshDir());
+      if (!rec) {
+        return respond({ ok: false, tool: "write-stdin", error: "session not found" });
+      }
+
+      if ("kind" in rec && rec.kind === "transfer") {
+        return respond({
+          ok: false,
+          tool: "write-stdin",
+          error: "write-stdin is not supported for transfer sessions",
+        });
+      }
+
+      if ("kind" in rec && rec.kind === "local") {
+        return respond({
+          ok: false,
+          tool: "write-stdin",
+          error: "write-stdin is not supported for local sessions in SSH mode",
+        });
+      }
+
+      const wantNewline = append_newline ?? true;
+      const payload = wantNewline ? `${data}\n` : data;
+      const buf = Buffer.from(payload, "utf8");
+      if (buf.byteLength > 64 * 1024) {
+        return respond({
+          ok: false,
+          tool: "write-stdin",
+          error: "payload too large (max 64KiB per call)",
+          data: { bytes: buf.byteLength },
+        });
+      }
+
+      const lease = await pool.get(rec.machine);
+      try {
+        const metaCmd = wrapSh(
+          `test -f "${toHomeAbs(rec.metaPath)}" && cat "${toHomeAbs(rec.metaPath)}" || true`
+        );
+        const metaRes = await runCommand(lease.value.ssh.client, metaCmd, {
+          maxStdoutBytes: 16 * 1024,
+          maxStderrBytes: 4 * 1024,
+        });
+        let meta: any = null;
+        try {
+          meta = JSON.parse(metaRes.stdout || "null");
+        } catch {
+          meta = null;
+        }
+        if (meta && typeof meta.status === "string" && meta.status === "done") {
+          const exitCode = typeof meta.exitCode === "number" ? meta.exitCode : undefined;
+          saveSession(
+            {
+              ...rec,
+              status: exitCode === 0 ? "done" : "failed",
+              exitCode,
+              updatedAt: isoNow(),
+            },
+            getOctsshDir()
+          );
+        }
+
+        const latest = loadSession(session_id, getOctsshDir());
+        if (!latest || latest.status !== "running") {
+          const latestExitCode =
+            latest && "exitCode" in latest && typeof latest.exitCode === "number"
+              ? latest.exitCode
+              : null;
+          return respond({
+            ok: false,
+            tool: "write-stdin",
+            error: "session is not running",
+            data: { status: latest?.status ?? null, exitCode: latestExitCode },
+          });
+        }
+
+        const stdinPath = rec.stdinPath;
+        const stdinLogPath = rec.stdinLogPath;
+        if (!stdinPath || !stdinLogPath) {
+          return respond({
+            ok: false,
+            tool: "write-stdin",
+            error:
+              "stdin is not available for this session (created by older OctSSH version?). Start a new exec-async session.",
+          });
+        }
+
+        const b64 = buf.toString("base64");
+        const runDir = rec.remoteDir;
+
+        const cmd = wrapSh(
+          [
+            `command -v base64 >/dev/null 2>&1 || { echo "base64 not found" >&2; exit 1; }`,
+            `run=\"$HOME/${runDir}\"`,
+            `chunk=\"$run/stdin.chunk.$$\"`,
+            `stdin=\"${toHomeAbs(stdinPath)}\"`,
+            `stdinlog=\"${toHomeAbs(stdinLogPath)}\"`,
+            `printf %s ${quoteForSh(b64)} | base64 -d > \"$chunk\"`,
+            `cat \"$chunk\" >> \"$stdinlog\" 2>/dev/null || true`,
+            `(cat \"$chunk\" > \"$stdin\") & wpid=$!`,
+            `i=0; while kill -0 \"$wpid\" 2>/dev/null; do i=$((i+1)); if [ \"$i\" -ge 20 ]; then kill \"$wpid\" 2>/dev/null || true; rm -f \"$chunk\"; echo \"stdin write blocked\" >&2; exit 1; fi; sleep 0.1; done`,
+            `wait \"$wpid\" 2>/dev/null || true`,
+            `rm -f \"$chunk\"`,
+          ].join("; ")
+        );
+
+        const res = await runCommand(lease.value.ssh.client, cmd, {
+          maxStdoutBytes: 8 * 1024,
+          maxStderrBytes: 8 * 1024,
+        });
+
+        if (res.exitCode !== 0) {
+          return respond({
+            ok: false,
+            tool: "write-stdin",
+            error: res.stderr || "failed to write stdin",
+            data: { exitCode: res.exitCode, stdout: res.stdout, stderr: res.stderr },
+          });
+        }
+
+        return respond({
+          ok: true,
+          tool: "write-stdin",
+          data: {
+            session_id,
+            machine: rec.machine,
+            bytes: buf.byteLength,
+            append_newline: wantNewline,
+          },
+        });
+      } finally {
+        lease.release();
+      }
+    }
+  );
+
+  server.registerTool(
+    toolName("cancel"),
     {
       title: "Cancel Async Session",
       description:
@@ -1002,7 +1159,7 @@ export function createOctsshServer() {
   );
 
   server.registerTool(
-    "sleep",
+    toolName("sleep"),
     {
       title: "Sleep",
       description: "Sleep for a duration (ms).",

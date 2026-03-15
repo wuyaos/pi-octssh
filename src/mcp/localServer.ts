@@ -41,6 +41,12 @@ function tailLocalFile(filePath: string, lines: number) {
   }
 }
 
+function normalizeToolPrefix(raw: string | undefined) {
+  const v = (raw ?? "").trim();
+  if (!v) return "";
+  return v.endsWith("_") ? v : `${v}_`;
+}
+
 let localCleanupStarted = false;
 
 function ensureLocalCleanupStarted() {
@@ -80,10 +86,13 @@ export function createOctsshLocalServer() {
   const cfg = loadConfig(getOctsshDir());
   const server = new McpServer({ name: "octssh", version: "0.0.0" });
 
+  const toolPrefix = normalizeToolPrefix(process.env.OCTSSH_TOOL_PREFIX);
+  const toolName = (name: string) => `${toolPrefix}${name}`;
+
   ensureLocalCleanupStarted();
 
   server.registerTool(
-    "list",
+    toolName("list"),
     {
       title: "List Targets",
       description: "List targets for this OctSSH instance (serve mode targets this host implicitly).",
@@ -95,7 +104,7 @@ export function createOctsshLocalServer() {
   );
 
   server.registerTool(
-    "info",
+    toolName("info"),
     {
       title: "Local Machine Info",
       description: "Get local machine info (serve mode).",
@@ -119,7 +128,7 @@ export function createOctsshLocalServer() {
   );
 
   server.registerTool(
-    "exec",
+    toolName("exec"),
     {
       title: "Execute Local Command",
       description: "Execute a command on THIS machine (no ssh).",
@@ -161,7 +170,7 @@ export function createOctsshLocalServer() {
   );
 
   server.registerTool(
-    "sudo-exec",
+    toolName("sudo-exec"),
     {
       title: "Execute Local Command (sudo)",
       description: "Execute a command on THIS machine with passwordless sudo (sudo -n).",
@@ -203,7 +212,7 @@ export function createOctsshLocalServer() {
   );
 
   server.registerTool(
-    "exec-async",
+    toolName("exec-async"),
     {
       title: "Execute Async (local)",
       description: "Execute a long-running command in background on THIS machine.",
@@ -241,7 +250,7 @@ export function createOctsshLocalServer() {
   );
 
   server.registerTool(
-    "exec-async-sudo",
+    toolName("exec-async-sudo"),
     {
       title: "Execute Async (sudo, local)",
       description: "Execute a long-running sudo command in background on THIS machine.",
@@ -279,7 +288,110 @@ export function createOctsshLocalServer() {
   );
 
   server.registerTool(
-    "get-result",
+    toolName("write-stdin"),
+    {
+      title: "Write to Async stdin (local)",
+      description: "Write data to a running local async session stdin.",
+      inputSchema: z.object({
+        session_id: z.string().min(1),
+        data: z.string(),
+        append_newline: z.boolean().optional(),
+      }),
+    },
+    async ({ session_id, data, append_newline }) => {
+      const rec = loadSession(session_id, getOctsshDir());
+      if (!rec) return respond({ ok: false, tool: "write-stdin", error: "session not found" });
+      if (!("kind" in rec) || rec.kind !== "local") {
+        return respond({ ok: false, tool: "write-stdin", error: "session is not a local async session" });
+      }
+
+      const stdinPath = rec.stdinPath;
+      const stdinLogPath = rec.stdinLogPath;
+      const metaPath = rec.metaPath;
+
+      if (!stdinPath || !stdinLogPath) {
+        return respond({
+          ok: false,
+          tool: "write-stdin",
+          error:
+            "stdin is not available for this session (created by older OctSSH version?). Start a new exec-async session.",
+        });
+      }
+
+      let meta: any = null;
+      try {
+        meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+      } catch {
+        meta = null;
+      }
+
+      let status = rec.status;
+      let exitCode = rec.exitCode ?? null;
+      if (meta && typeof meta.status === "string") {
+        if (meta.status === "running") status = "running";
+        if (meta.status === "done") {
+          status = meta.exitCode === 0 ? "done" : "failed";
+          if (typeof meta.exitCode === "number") exitCode = meta.exitCode;
+        }
+      }
+      const prevExitCode = typeof rec.exitCode === "number" ? rec.exitCode : null;
+      if (status !== rec.status || exitCode !== prevExitCode) {
+        saveSession(
+          { ...rec, status, exitCode: exitCode === null ? undefined : exitCode, updatedAt: isoNow() },
+          getOctsshDir()
+        );
+      }
+      if (status !== "running") {
+        return respond({
+          ok: false,
+          tool: "write-stdin",
+          error: "session is not running",
+          data: { status, exitCode },
+        });
+      }
+
+      const wantNewline = append_newline ?? true;
+      const payload = wantNewline ? `${data}\n` : data;
+      const buf = Buffer.from(payload, "utf8");
+      if (buf.byteLength > 64 * 1024) {
+        return respond({
+          ok: false,
+          tool: "write-stdin",
+          error: "payload too large (max 64KiB per call)",
+          data: { bytes: buf.byteLength },
+        });
+      }
+
+      try {
+        fs.appendFileSync(stdinLogPath, buf);
+      } catch (err: any) {
+        return respond({ ok: false, tool: "write-stdin", error: String(err?.message ?? err) });
+      }
+
+      try {
+        const fd = fs.openSync(
+          stdinPath,
+          fs.constants.O_WRONLY | fs.constants.O_NONBLOCK
+        );
+        try {
+          fs.writeSync(fd, buf);
+        } finally {
+          fs.closeSync(fd);
+        }
+      } catch (err: any) {
+        return respond({ ok: false, tool: "write-stdin", error: String(err?.message ?? err) });
+      }
+
+      return respond({
+        ok: true,
+        tool: "write-stdin",
+        data: { session_id, machine: rec.machine, bytes: buf.byteLength, append_newline: wantNewline },
+      });
+    }
+  );
+
+  server.registerTool(
+    toolName("get-result"),
     {
       title: "Get Async Result (local)",
       description: "Get local async status; optionally tail last N lines from logs.",
@@ -332,7 +444,7 @@ export function createOctsshLocalServer() {
   );
 
   server.registerTool(
-    "grep-result",
+    toolName("grep-result"),
     {
       title: "Search Async Logs (local)",
       description: "Search local async stdout/stderr logs by regex pattern.",
@@ -385,7 +497,7 @@ export function createOctsshLocalServer() {
   );
 
   server.registerTool(
-    "cancel",
+    toolName("cancel"),
     {
       title: "Cancel Async Session (local)",
       description: "Terminate a running local async session by session_id.",
@@ -403,10 +515,11 @@ export function createOctsshLocalServer() {
 
       const sig = (signal ?? "TERM").toUpperCase();
       const safeSig = /^[A-Z0-9]+$/.test(sig) ? sig : "TERM";
+      const normalizedSig = safeSig.startsWith("SIG") ? safeSig : `SIG${safeSig}`;
       const pid = (rec as any).cmdPid as number | undefined;
       if (pid) {
         try {
-          process.kill(pid, safeSig as any);
+          process.kill(pid, normalizedSig as NodeJS.Signals);
         } catch {
           // ignore
         }
@@ -418,7 +531,7 @@ export function createOctsshLocalServer() {
   );
 
   server.registerTool(
-    "sleep",
+    toolName("sleep"),
     {
       title: "Sleep",
       description: "Sleep for a duration (ms).",
