@@ -24,6 +24,9 @@ const remoteScreenSessionSchema = z
     stderrPath: z.string().min(1),
     metaPath: z.string().min(1),
 
+    stdinPath: z.string().min(1).optional(),
+    stdinLogPath: z.string().min(1).optional(),
+
     exitCode: z.number().int().optional()
   })
   .strict();
@@ -67,6 +70,9 @@ const localProcessSessionSchema = z
     stdoutPath: z.string().min(1),
     stderrPath: z.string().min(1),
     metaPath: z.string().min(1),
+
+    stdinPath: z.string().min(1).optional(),
+    stdinLogPath: z.string().min(1).optional(),
 
     exitCode: z.number().int().optional(),
   })

@@ -19,6 +19,8 @@ export type StartedLocalAsync = {
   stdoutPath: string;
   stderrPath: string;
   metaPath: string;
+  stdinPath: string;
+  stdinLogPath: string;
 };
 
 function nowIso() {
@@ -36,9 +38,15 @@ function buildWrapperFile(params: { sudo: boolean }) {
     'stderr="$run/stderr.log"',
     'meta="$run/meta.json"',
     'pidfile="$run/cmd.pid"',
+    'stdin="$run/stdin.fifo"',
+    'stdinlog="$run/stdin.log"',
     'ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)',
     'printf "{\\"status\\":\\"running\\",\\"startedAt\\":\\"%s\\"}\\n" "$ts" > "$meta"',
-    `(${inner}) >"$stdout" 2>"$stderr" & cmdpid=$!`,
+    'rm -f "$stdin" 2>/dev/null || true',
+    'mkfifo "$stdin"',
+    ': > "$stdinlog"',
+    'exec 3<> "$stdin"',
+    `(${inner}) <&3 >"$stdout" 2>"$stderr" & cmdpid=$!`,
     'echo "$cmdpid" > "$pidfile"',
     'wait "$cmdpid"; code=$?',
     'ts2=$(date -u +%Y-%m-%dT%H:%M:%SZ)',
@@ -53,6 +61,8 @@ export async function startLocalAsync(params: StartLocalAsyncParams): Promise<St
   const stdoutPath = path.join(runDir, "stdout.log");
   const stderrPath = path.join(runDir, "stderr.log");
   const metaPath = path.join(runDir, "meta.json");
+  const stdinPath = path.join(runDir, "stdin.fifo");
+  const stdinLogPath = path.join(runDir, "stdin.log");
   const pidPath = path.join(runDir, "cmd.pid");
   const wrapperPath = path.join(runDir, "wrapper.sh");
 
@@ -98,9 +108,11 @@ export async function startLocalAsync(params: StartLocalAsyncParams): Promise<St
       stdoutPath,
       stderrPath,
       metaPath,
+      stdinPath,
+      stdinLogPath,
     },
     baseDir
   );
 
-  return { session_id: sessionId, cmdPid, runDir, stdoutPath, stderrPath, metaPath };
+  return { session_id: sessionId, cmdPid, runDir, stdoutPath, stderrPath, metaPath, stdinPath, stdinLogPath };
 }

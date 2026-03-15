@@ -19,6 +19,8 @@ export type StartedAsync = {
   stdoutPath: string;
   stderrPath: string;
   metaPath: string;
+  stdinPath: string;
+  stdinLogPath: string;
 };
 
 function nowIso() {
@@ -39,9 +41,15 @@ function buildWrapperFile(params: { sessionId: string; sudo: boolean }) {
     'stderr="$run/stderr.log"',
     'meta="$run/meta.json"',
     'pidfile="$run/cmd.pid"',
+    'stdin="$run/stdin.fifo"',
+    'stdinlog="$run/stdin.log"',
     'ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)',
     'printf "{\\"status\\":\\"running\\",\\"startedAt\\":\\"%s\\"}\\n" "$ts" > "$meta"',
-    `(${inner}) >"$stdout" 2>"$stderr" & cmdpid=$!`,
+    'rm -f "$stdin" 2>/dev/null || true',
+    'mkfifo "$stdin"',
+    ': > "$stdinlog"',
+    'exec 3<> "$stdin"',
+    `(${inner}) <&3 >"$stdout" 2>"$stderr" & cmdpid=$!`,
     'echo "$cmdpid" > "$pidfile"',
     'wait "$cmdpid"; code=$?',
     'ts2=$(date -u +%Y-%m-%dT%H:%M:%SZ)',
@@ -62,11 +70,18 @@ export async function startAsyncInScreen(
   const stdoutPath = `${remoteDir}/stdout.log`;
   const stderrPath = `${remoteDir}/stderr.log`;
   const metaPath = `${remoteDir}/meta.json`;
+  const stdinPath = `${remoteDir}/stdin.fifo`;
+  const stdinLogPath = `${remoteDir}/stdin.log`;
 
   // Preflight: require screen.
   const hasScreen = await runCommand(client, wrapSh("command -v screen >/dev/null 2>&1"));
   if (hasScreen.exitCode !== 0) {
     throw new Error("Remote prerequisite missing: `screen` is required on the server.");
+  }
+
+  const hasMkfifo = await runCommand(client, wrapSh("command -v mkfifo >/dev/null 2>&1"));
+  if (hasMkfifo.exitCode !== 0) {
+    throw new Error("Remote prerequisite missing: `mkfifo` is required on the server.");
   }
 
   const wrapperFile = buildWrapperFile({ sessionId, sudo: params.sudo });
@@ -171,6 +186,8 @@ export async function startAsyncInScreen(
       stdoutPath,
       stderrPath,
       metaPath,
+      stdinPath,
+      stdinLogPath,
     },
     getOctsshDir()
   );
@@ -183,5 +200,7 @@ export async function startAsyncInScreen(
     stdoutPath,
     stderrPath,
     metaPath,
+    stdinPath,
+    stdinLogPath,
   };
 }
