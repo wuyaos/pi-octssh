@@ -92,6 +92,21 @@ export OCTSSH_TOOL_PREFIX="us1_"
 
 示例：`list` 会变成 `us1_list`。
 
+### write-stdin（异步任务交互输入）
+
+`write-stdin` 用于向正在运行的 `exec-async` 会话写入 stdin（给长任务/交互式脚本喂输入）。
+
+典型流程：
+1) 用 `exec-async` 启动一个会读取 stdin 的长任务
+2) 用 `write-stdin(session_id, data)` 发送输入
+3) 用 `get-result(session_id)` 轮询输出
+
+注意：
+- `append_newline` 默认是 `true`。
+- 单次写入最大 **64KiB**。
+- 这里的 stdin 是持续的流：**不会发送 EOF**。如果你的程序需要 EOF 才会退出，请用 `cancel` 结束会话。
+- 如果设置了 `OCTSSH_TOOL_PREFIX`，工具名也会带前缀（例如 `us1_write-stdin`）。
+
 ### 接入 MCP 客户端
 
 #### 通用配置 (stdio)

@@ -94,6 +94,21 @@ export OCTSSH_TOOL_PREFIX="us1_"
 
 Example: `list` becomes `us1_list`.
 
+### write-stdin (async interactive input)
+
+`write-stdin` lets you send input to a running `exec-async` session.
+
+Typical flow:
+1) Start a long-running command that reads stdin (via `exec-async`)
+2) Send data with `write-stdin(session_id, data)`
+3) Poll output with `get-result(session_id)`
+
+Notes:
+- Default `append_newline` is `true`.
+- Max payload is **64KiB per call**.
+- This is a streaming stdin: **EOF is not sent**. If the program exits on EOF, cancel the session instead.
+- If you set `OCTSSH_TOOL_PREFIX`, tool names are prefixed too (e.g. `us1_write-stdin`).
+
 ### MCP Client Configuration
 
 #### General (stdio)
