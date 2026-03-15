@@ -28,6 +28,7 @@ OctSSH provides a complete set of async tools to prevent LLMs from timing out on
 | `sudo-exec(machine, command, confirm_code?)` | Run synchronously as root (`sudo -n`) |
 | `exec-async(machine, command, confirm_code?)` | Run long tasks in background (screen) |
 | `exec-async-sudo(...)` | Run background tasks as root |
+| `write-stdin(session_id, data, append_newline?)` | Write to stdin of a running async task |
 | `get-result(session_id, lines?)` | Inspect async task output |
 | `grep-result(session_id, pattern, ...)` | Search task logs |
 | `cancel(session_id)` | Terminate a task |
@@ -82,6 +83,16 @@ octssh serve
 - **Auth**: Prints a random key on startup. Clients must send header `X-OctSSH-Key: <key>`.
   - Set fixed key: `export OCTSSH_SERVE_KEY="my-secret"`
 - **Tool Changes**: Tools run on *this* machine. **`machine` parameter is omitted**. SSH transfer tools (`upload`/`download`) are disabled.
+
+### Tool Prefix (optional)
+
+To avoid tool name collisions when you run multiple OctSSH instances, you can prefix all exposed tools:
+
+```bash
+export OCTSSH_TOOL_PREFIX="us1_"
+```
+
+Example: `list` becomes `us1_list`.
 
 ### MCP Client Configuration
 
