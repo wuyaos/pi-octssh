@@ -1,10 +1,10 @@
 import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 
 import { splitShellWords } from "./shellwords.js";
 import { createPending, deletePending, loadPending } from "../state/pending.js";
 import { getOctsshDir } from "../state/paths.js";
-import { runLocalCommand } from "../local/runLocalCommand.js";
 
 export type SecurityConfig = {
   denyRegex: string[];
@@ -128,48 +128,62 @@ async function previewDeletePathsLocal(targets: string[]) {
     return raw;
   });
 
-  // Bounded preview: up to 10001 paths, sample first 10.
-  const script = [
-    "set -eu",
-    "limit=10001",
-    "(for p in \"$@\"; do if [ -e \"$p\" ]; then find \"$p\" -print 2>/dev/null; fi; done)" +
-      " | head -n $limit" +
-      " | awk -v limit=$limit 'NR<=10{print} END{print \"__OCTSSH_TOTAL__:\" NR; print \"__OCTSSH_TRUNCATED__:\" (NR>=limit?\"true\":\"false\")}'",
-  ].join("; ");
-
-  const res = await runLocalCommand({
-    command: script,
-    shellArgs: ["sh", ...normalized],
-    options: { maxStdoutBytes: 64 * 1024, maxStderrBytes: 8 * 1024 },
-  });
-
-  // If the preview script failed (e.g. `find` is missing), degrade gracefully.
-  if (res.exitCode !== 0) {
-    const existing = normalized.filter((p) => {
-      try {
-        return fs.existsSync(p);
-      } catch {
-        return false;
-      }
-    });
-    return { type: "rm-preview", total: existing.length, truncated: false, sample: existing.slice(0, 10) };
-  }
-
-  const lines = res.stdout.split(/\r?\n/).filter(Boolean);
+  const limit = 10001;
+  const sampleLimit = 10;
   const sample: string[] = [];
   let total = 0;
   let truncated = false;
-  for (const l of lines) {
-    if (l.startsWith("__OCTSSH_TOTAL__:")) {
-      total = Number(l.split(":")[1] ?? 0) || 0;
+
+  const push = (p: string) => {
+    total += 1;
+    if (sample.length < sampleLimit) sample.push(p);
+    if (total >= limit) truncated = true;
+  };
+
+  const walk = (root: string) => {
+    const stack: string[] = [root];
+    while (stack.length > 0) {
+      const p = stack.pop();
+      if (!p) continue;
+      if (truncated) return;
+
+      push(p);
+
+      let st: fs.Stats;
+      try {
+        st = fs.lstatSync(p);
+      } catch {
+        continue;
+      }
+
+      if (st.isSymbolicLink()) continue;
+      if (!st.isDirectory()) continue;
+
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(p, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+
+      for (const ent of entries) {
+        if (truncated) return;
+        const child = path.join(p, ent.name);
+        stack.push(child);
+      }
+    }
+  };
+
+  for (const p of normalized) {
+    if (truncated) break;
+    try {
+      if (!fs.existsSync(p)) continue;
+    } catch {
       continue;
     }
-    if (l.startsWith("__OCTSSH_TRUNCATED__:")) {
-      truncated = (l.split(":")[1] ?? "").trim() === "true";
-      continue;
-    }
-    sample.push(l);
+    walk(p);
   }
+
   return { type: "rm-preview", total, truncated, sample };
 }
 

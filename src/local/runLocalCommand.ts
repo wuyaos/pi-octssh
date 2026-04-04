@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 
+import { selectLocalShell, spawnShell } from "./shell.js";
+
 export type ExecOptions = {
   maxStdoutBytes?: number;
   maxStderrBytes?: number;
@@ -32,13 +34,35 @@ export async function runLocalCommand(params: {
 
   const extra = params.shellArgs ?? [];
 
-  const child = params.sudo
-    ? spawn("sudo", ["-n", "--", "sh", "-lc", params.command, ...extra], {
+  const shell = selectLocalShell();
+  if (params.sudo && shell.kind !== "sh") {
+    return {
+      stdout: "",
+      stderr: "sudo is not supported for this local shell. On Windows, run OctSSH as Administrator or use exec without sudo.",
+      exitCode: 126,
+      signal: null,
+      truncated: { stdout: false, stderr: false },
+    };
+  }
+
+  const child = (() => {
+    if (params.sudo) {
+      return spawn("sudo", ["-n", "--", "sh", "-lc", params.command, ...extra], {
         stdio: ["ignore", "pipe", "pipe"],
-      })
-    : spawn("sh", ["-lc", params.command, ...extra], {
-        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
       });
+    }
+
+    return spawnShell({
+      shell,
+      command: params.command,
+      shellArgs: extra,
+      options: {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      },
+    });
+  })();
 
   const stdoutChunks: Buffer[] = [];
   const stderrChunks: Buffer[] = [];
@@ -67,8 +91,16 @@ export async function runLocalCommand(params: {
     stderrChunks.push(chunk);
   });
 
-  return await new Promise<ExecResult>((resolve, reject) => {
-    child.on("error", reject);
+  return await new Promise<ExecResult>((resolve) => {
+    child.on("error", (err: any) => {
+      resolve({
+        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+        stderr: String(err?.message ?? err),
+        exitCode: 127,
+        signal: null,
+        truncated: { stdout: stdoutTrunc, stderr: stderrTrunc },
+      });
+    });
     child.on("close", (code, signal) => {
       resolve({
         stdout: Buffer.concat(stdoutChunks).toString("utf8"),

@@ -110,6 +110,9 @@ test('Streamable HTTP serve supports write-stdin for async sessions', async () =
   const { createOctsshLocalServer } = require('../dist/mcp/localServer.js');
   const { runStreamableHttpServer } = require('../dist/mcp/httpServe.js');
 
+  const prevShell = process.env.OCTSSH_SHELL;
+  if (process.platform === 'win32') process.env.OCTSSH_SHELL = 'powershell';
+
   const started = await runStreamableHttpServer({
     createServer: createOctsshLocalServer,
     config: { host: '127.0.0.1', port: 0, authKey: 'test-key' }
@@ -133,10 +136,15 @@ test('Streamable HTTP serve supports write-stdin for async sessions', async () =
   try {
     await client.connect(transport);
 
+    const asyncCommand =
+      process.platform === 'win32'
+        ? '$line=[Console]::In.ReadLine(); Write-Output ("got:" + $line); Start-Sleep -Milliseconds 50'
+        : 'read -r line; echo got:$line; sleep 0.05';
+
     const execAsyncRes = await client.callTool({
       name: 'exec-async',
       arguments: {
-        command: 'read -r line; echo got:$line; sleep 0.05'
+        command: asyncCommand
       }
     });
     const execAsyncParsed = parse(execAsyncRes);
@@ -175,5 +183,9 @@ test('Streamable HTTP serve supports write-stdin for async sessions', async () =
   } finally {
     try { await transport.close(); } catch {}
     await started.close();
+    if (process.platform === 'win32') {
+      if (typeof prevShell === 'string') process.env.OCTSSH_SHELL = prevShell;
+      else delete process.env.OCTSSH_SHELL;
+    }
   }
 });

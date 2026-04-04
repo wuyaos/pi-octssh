@@ -84,6 +84,21 @@ octssh serve
   - Set fixed key: `export OCTSSH_SERVE_KEY="my-secret"`
 - **Tool Changes**: Tools run on *this* machine. **`machine` parameter is omitted**. SSH transfer tools (`upload`/`download`) are disabled.
 
+#### Windows notes (serve mode)
+
+On Windows, OctSSH serve will auto-select a local shell in this order:
+
+1) `sh` (if available, e.g. Git-Bash/MSYS)
+2) `pwsh`
+3) `powershell`
+4) `cmd`
+
+Override with:
+
+```bash
+set OCTSSH_SHELL=powershell
+```
+
 ### Tool Prefix (optional)
 
 To avoid tool name collisions when you run multiple OctSSH instances, you can prefix all exposed tools:

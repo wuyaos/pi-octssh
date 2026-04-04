@@ -333,7 +333,7 @@ export function createOctsshLocalServer() {
         });
       }
 
-      const expectedStdinPath = path.join(expectedRunDir, "stdin.fifo");
+      const expectedStdinPath = path.join(expectedRunDir, "stdin.in");
       const expectedStdinLogPath = path.join(expectedRunDir, "stdin.log");
       if (path.resolve(stdinPath) !== path.resolve(expectedStdinPath)) {
         return respond({ ok: false, tool: "write-stdin", error: "invalid stdinPath" });
@@ -346,9 +346,6 @@ export function createOctsshLocalServer() {
         const st = fs.lstatSync(stdinPath);
         if (st.isSymbolicLink()) {
           return respond({ ok: false, tool: "write-stdin", error: "stdinPath must not be a symlink" });
-        }
-        if (!st.isFIFO()) {
-          return respond({ ok: false, tool: "write-stdin", error: "stdinPath is not a FIFO" });
         }
       } catch (err: any) {
         return respond({ ok: false, tool: "write-stdin", error: String(err?.message ?? err) });
@@ -415,38 +412,10 @@ export function createOctsshLocalServer() {
         return respond({ ok: false, tool: "write-stdin", error: String(err?.message ?? err) });
       }
 
-      const startedAt = Date.now();
-      while (true) {
-        try {
-          const fd = fs.openSync(stdinPath, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
-          try {
-            let off = 0;
-            while (off < buf.length) {
-              const n = fs.writeSync(fd, buf, off, buf.length - off);
-              if (!Number.isFinite(n) || n <= 0) {
-                throw new Error("failed to write to stdin FIFO");
-              }
-              off += n;
-            }
-          } finally {
-            fs.closeSync(fd);
-          }
-          break;
-        } catch (err: any) {
-          const code = String(err?.code ?? "");
-          if (code === "EAGAIN") {
-            if (Date.now() - startedAt > 1500) {
-              return respond({
-                ok: false,
-                tool: "write-stdin",
-                error: "stdin FIFO backpressure (try again later)",
-              });
-            }
-            await sleepMs(25);
-            continue;
-          }
-          return respond({ ok: false, tool: "write-stdin", error: String(err?.message ?? err) });
-        }
+      try {
+        fs.appendFileSync(stdinPath, buf);
+      } catch (err: any) {
+        return respond({ ok: false, tool: "write-stdin", error: String(err?.message ?? err) });
       }
 
       return respond({

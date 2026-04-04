@@ -82,6 +82,21 @@ octssh serve
   - 固定 Key 配置：`export OCTSSH_SERVE_KEY="my-secret"`
 - **工具变化**：此模式下工具直接操作本机，**不接受 `machine` 参数**，且不暴露 SSH 传输工具（`upload`/`download`）。
 
+#### Windows 说明（serve 模式）
+
+在 Windows 上，OctSSH serve 会自动选择本地 shell，优先级如下：
+
+1) `sh`（如果存在，例如 Git-Bash/MSYS）
+2) `pwsh`
+3) `powershell`
+4) `cmd`
+
+可通过环境变量强制指定：
+
+```bat
+set OCTSSH_SHELL=powershell
+```
+
 ### 工具前缀（可选）
 
 如果你需要同时运行多个 OctSSH 实例（避免工具名冲突），可以给所有暴露的工具增加前缀：
