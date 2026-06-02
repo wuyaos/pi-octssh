@@ -2,6 +2,10 @@
 
 [English README](README.md)
 
+[![XEnvManager V1.0](https://img.shields.io/badge/XEnvManager-V1.0-blue)](https://github.com/AliyahZombie/XEnvMananger)
+
+<p align="center">本项目支持 XEnvManager 协议</p>
+
 VibeCoding 的时候，我突然想到，能不能让 agent 帮我上服务器部署代码呢，于是，我开发了
 
 <img src="logo.png" width="200" />

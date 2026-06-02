@@ -6,9 +6,15 @@ import { runInitCli } from "./init/initCli.js";
 import { loadConfig } from "./state/config.js";
 import { getOctsshDir } from "./state/paths.js";
 import { runStreamableHttpServer } from "./mcp/httpServe.js";
+import { getEnvManagerProtocolDoc, hasEnvManagerProtocolFlag } from "./envManager/protocol.js";
 
 async function main() {
   const args = process.argv.slice(2);
+  if (hasEnvManagerProtocolFlag(args)) {
+    process.stdout.write(`${JSON.stringify(getEnvManagerProtocolDoc(args), null, 2)}\n`);
+    return;
+  }
+
   if (args[0] === "init") {
     await runInitCli();
     return;
