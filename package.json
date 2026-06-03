@@ -1,6 +1,6 @@
 {
   "name": "@aliyahzombie/octssh",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "OctSSH - Make LLMs safely control your servers for deployment (MCP)",
   "license": "UNLICENSED",
   "repository": {
