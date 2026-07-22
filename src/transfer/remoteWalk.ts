@@ -1,5 +1,5 @@
-import type { SftpClient } from "../ssh/sftp.js";
-import { sftpReaddir, sftpStat } from "../ssh/sftp.js";
+import type { SftpClient } from "../ssh/sftp.ts";
+import { sftpReaddir, sftpStat } from "../ssh/sftp.ts";
 
 export type RemoteFileEntry = {
   absPath: string;

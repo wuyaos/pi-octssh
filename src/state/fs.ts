@@ -11,6 +11,12 @@ export function atomicWriteFileSync(filePath: string, contents: string) {
 
   const tmpPath = `${filePath}.tmp.${process.pid}`;
   fs.writeFileSync(tmpPath, contents, { encoding: "utf8" });
+  // Windows 上 renameSync 目标已存在会报 EPERM,先尝试删除。
+  try {
+    fs.unlinkSync(filePath);
+  } catch {
+    /* 目标不存在,忽略 */
+  }
   fs.renameSync(tmpPath, filePath);
 }
 

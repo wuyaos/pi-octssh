@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { loadSession } from "./sessions.js";
+import { loadSession } from "./sessions.ts";
 
 export function listSessionIds(baseDir: string) {
   const dir = path.join(baseDir, "sessions");

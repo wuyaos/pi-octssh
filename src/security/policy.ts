@@ -1,9 +1,7 @@
 import type { Client } from "ssh2";
-import { runCommand } from "../ssh/runCommand.js";
-import { wrapSh } from "../ssh/shell.js";
-import { splitShellWords } from "./shellwords.js";
-import { createPending, deletePending, loadPending } from "../state/pending.js";
-import { getOctsshDir } from "../state/paths.js";
+import { runCommand } from "../ssh/runCommand.ts";
+import { wrapSh } from "../ssh/shell.ts";
+import { splitShellWords } from "./shellwords.ts";
 
 export type SecurityConfig = {
   denyRegex: string[];
@@ -91,8 +89,7 @@ export type CommandGuardResult =
   | { action: "allow" }
   | { action: "block"; reason: string; message: string }
   | {
-      action: "confirm";
-      confirm_code: string;
+      action: "needs_confirmation";
       message: string;
       preview: { type: string; total: number; truncated: boolean; sample: string[] };
     };
@@ -149,7 +146,7 @@ function isClearlyDangerousRootDelete(targets: string[]) {
   return false;
 }
 
-async function previewDeletePaths(client: Client, targets: string[]) {
+async function previewDeletePaths(client: Client, targets: string[], signal?: AbortSignal) {
   // Bounded preview: collect up to 10001 paths total, then truncate.
   // This avoids remote CPU/disk meltdown on huge trees.
   const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
@@ -180,6 +177,7 @@ async function previewDeletePaths(client: Client, targets: string[]) {
   const res = await runCommand(client, cmd, {
     maxStdoutBytes: 64 * 1024,
     maxStderrBytes: 8 * 1024,
+    signal,
   });
   const lines = res.stdout.split(/\r?\n/).filter(Boolean);
   const sample: string[] = [];
@@ -204,8 +202,9 @@ export async function guardExecCommand(params: {
   machine: string;
   command: string;
   allowSudo: boolean;
-  confirm_code?: string;
   security: SecurityConfig;
+  authorized?: boolean;
+  signal?: AbortSignal;
 }) : Promise<CommandGuardResult> {
   const effective = buildEffectiveSecurityConfig(params.security);
 
@@ -242,28 +241,7 @@ export async function guardExecCommand(params: {
     !!matchesAnyRegex(params.command, effective.requireConfirmRegex);
   if (!needConfirm) return { action: "allow" };
 
-  // Confirmation path.
-  if (params.confirm_code) {
-    const rec = loadPending(params.confirm_code, getOctsshDir());
-    if (!rec || rec.kind !== "exec") {
-      return {
-        action: "block",
-        reason: "invalid_confirm_code",
-        message:
-          "Invalid confirm code. Re-run the command without confirm_code to get a new preview.",
-      };
-    }
-    if (rec.machine !== params.machine || rec.command !== params.command) {
-      return {
-        action: "block",
-        reason: "confirm_mismatch",
-        message:
-          "Confirm code does not match this command/machine. Re-run without confirm_code to preview again.",
-      };
-    }
-    deletePending(params.confirm_code, getOctsshDir());
-    return { action: "allow" };
-  }
+  if (params.authorized) return { action: "allow" };
 
   // Only preview rm-based destructive commands.
   const targets = extractRmTargets(params.command) ?? [];
@@ -283,29 +261,14 @@ export async function guardExecCommand(params: {
     };
   }
 
-  const preview = await previewDeletePaths(params.client, targets);
-  const code = createPending(
-    {
-      kind: "exec",
-      createdAt: new Date().toISOString(),
-      machine: params.machine,
-      command: params.command,
-      preview,
-    },
-    getOctsshDir()
-  );
+  const preview = await previewDeletePaths(params.client, targets, params.signal);
 
   const msg =
     "DANGEROUS OPERATION DETECTED.\n" +
     "This command can permanently delete files. OctSSH is running in VIRTUAL MODE and refused to execute it.\n" +
     `Previewed ${preview.total}${preview.truncated ? "+" : ""} affected paths.\n` +
-    "If you are 100% sure, re-run the SAME command with confirm_code.\n" +
+    "User confirmation is required before execution.\n" +
     "Before confirming: enumerate the listed paths and explain WHY each is safe to delete.";
 
-  return {
-    action: "confirm",
-    confirm_code: code,
-    message: msg,
-    preview,
-  };
+  return { action: "needs_confirmation", message: msg, preview };
 }

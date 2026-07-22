@@ -15,14 +15,16 @@ type Entry<T> = {
 };
 
 export class ConnectionPool<K, T> {
-  private readonly create: (key: K) => Promise<T>;
+  private readonly create: (key: K, signal?: AbortSignal) => Promise<T>;
   private readonly closeFn: (value: T) => Promise<void> | void;
   private readonly maxConnections: number;
   private readonly idleTtlMs: number;
   private readonly entries = new Map<K, Entry<T>>();
+  private readonly inflight = new Map<K, Promise<Entry<T>>>();
+  private closed = false;
 
   constructor(params: {
-    create: (key: K) => Promise<T>;
+    create: (key: K, signal?: AbortSignal) => Promise<T>;
     close: (value: T) => Promise<void> | void;
     options: ConnectionPoolOptions;
   }) {
@@ -36,32 +38,50 @@ export class ConnectionPool<K, T> {
     return this.entries.size;
   }
 
-  async get(key: K): Promise<ConnectionLease<T>> {
-    const now = Date.now();
-    const existing = this.entries.get(key);
-    if (existing) {
-      existing.refCount += 1;
-      existing.lastUsedAt = now;
-      return {
-        value: existing.value,
-        release: () => {
-          existing.refCount = Math.max(0, existing.refCount - 1);
-          existing.lastUsedAt = Date.now();
-        },
-      };
+  async get(key: K, signal?: AbortSignal): Promise<ConnectionLease<T>> {
+    if (this.closed) throw new Error("Connection pool is closed");
+
+    let entry = this.entries.get(key);
+    if (!entry) {
+      let pending = this.inflight.get(key);
+      if (!pending) {
+        pending = this.createEntry(key, signal);
+        this.inflight.set(key, pending);
+        pending.finally(() => this.inflight.delete(key)).catch(() => undefined);
+      }
+      entry = await pending;
+      if (this.closed) {
+        if (this.entries.get(key) === entry) this.entries.delete(key);
+        await this.closeFn(entry.value);
+        throw new Error("Connection pool was closed while connecting");
+      }
     }
 
-    await this.evictIfNeeded();
-    const value = await this.create(key);
-    const entry: Entry<T> = { value, lastUsedAt: now, refCount: 1 };
-    this.entries.set(key, entry);
+    entry.refCount += 1;
+    entry.lastUsedAt = Date.now();
+    let released = false;
     return {
-      value,
+      value: entry.value,
       release: () => {
-        entry.refCount = Math.max(0, entry.refCount - 1);
-        entry.lastUsedAt = Date.now();
+        if (released) return;
+        released = true;
+        entry!.refCount = Math.max(0, entry!.refCount - 1);
+        entry!.lastUsedAt = Date.now();
       },
     };
+  }
+
+  private async createEntry(key: K, signal?: AbortSignal): Promise<Entry<T>> {
+    await this.evictIfNeeded();
+    const value = await this.create(key, signal);
+    const entry: Entry<T> = { value, lastUsedAt: Date.now(), refCount: 0 };
+    const raced = this.entries.get(key);
+    if (raced) {
+      await this.closeFn(value);
+      return raced;
+    }
+    this.entries.set(key, entry);
+    return entry;
   }
 
   async close(key: K) {
@@ -71,7 +91,16 @@ export class ConnectionPool<K, T> {
     await this.closeFn(entry.value);
   }
 
+  async closeAll() {
+    this.closed = true;
+    await Promise.allSettled([...this.inflight.values()]);
+    const entries = [...this.entries.values()];
+    this.entries.clear();
+    await Promise.allSettled(entries.map((entry) => Promise.resolve(this.closeFn(entry.value))));
+  }
+
   async sweep(now = Date.now()) {
+    if (this.closed) return;
     for (const [key, entry] of this.entries) {
       if (entry.refCount > 0) continue;
       if (now - entry.lastUsedAt < this.idleTtlMs) continue;
@@ -80,16 +109,15 @@ export class ConnectionPool<K, T> {
   }
 
   private async evictIfNeeded() {
-    if (this.entries.size < this.maxConnections) return;
+    if (this.entries.size + this.inflight.size < this.maxConnections) return;
 
-    // Evict the least recently used idle entry.
     let victimKey: K | null = null;
     let victimLastUsed = Infinity;
-    for (const [k, v] of this.entries) {
-      if (v.refCount > 0) continue;
-      if (v.lastUsedAt < victimLastUsed) {
-        victimLastUsed = v.lastUsedAt;
-        victimKey = k;
+    for (const [key, entry] of this.entries) {
+      if (entry.refCount > 0) continue;
+      if (entry.lastUsedAt < victimLastUsed) {
+        victimLastUsed = entry.lastUsedAt;
+        victimKey = key;
       }
     }
 
@@ -98,7 +126,6 @@ export class ConnectionPool<K, T> {
         `Max connections reached (${this.maxConnections}); no idle connection available to evict.`
       );
     }
-
     await this.close(victimKey);
   }
 }

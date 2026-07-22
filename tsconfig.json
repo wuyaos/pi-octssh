@@ -1,21 +1,23 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "module": "CommonJS",
-    "moduleResolution": "Node",
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
     "outDir": "dist",
     "rootDir": ".",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "declaration": true,
-    "sourceMap": true,
-    "types": [
-      "node"
-    ]
+    "declaration": false,
+    "sourceMap": false,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "types": ["node"]
   },
   "include": [
-    "src/**/*.ts"
+    "extensions/**/*.ts",
+    "src/**/*.ts",
+    "skills/**/*.ts"
   ]
 }

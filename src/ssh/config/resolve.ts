@@ -1,8 +1,13 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import fg from "fast-glob";
-import { getSshConfigPath } from "./paths.js";
+import { getSshConfigPath } from "./paths.ts";
+
+function homeDir() {
+  return process.env.HOME || process.env.USERPROFILE || os.homedir();
+}
 
 export type ResolvedSshHostConfig = {
   alias: string;
@@ -48,7 +53,7 @@ function hostMatchesPatterns(host: string, patterns: string[]) {
 
 function expandIncludePattern(pattern: string, baseDir: string) {
   const p = pattern.startsWith("~")
-    ? path.join(process.env.HOME ?? "", pattern.slice(1))
+    ? path.join(homeDir(), pattern.slice(1))
     : pattern;
   const abs = path.isAbsolute(p) ? p : path.join(baseDir, p);
 

@@ -1,6 +1,6 @@
 import type { Client } from "ssh2";
-import { runCommand } from "../ssh/runCommand.js";
-import { wrapSh } from "../ssh/shell.js";
+import { runCommand } from "../ssh/runCommand.ts";
+import { wrapSh } from "../ssh/shell.ts";
 
 export type ExtendedInfo = {
   os?: string;

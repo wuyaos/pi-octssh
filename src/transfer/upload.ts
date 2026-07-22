@@ -1,10 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Client } from "ssh2";
-import { withSftp, sftpFastPut, sftpMkdirp, sftpStat } from "../ssh/sftp.js";
-import { mapLimit } from "../util/concurrency.js";
-import { resolveRemotePath } from "./remotePath.js";
-import { walkLocal } from "./localWalk.js";
+import { withSftp, sftpFastPut, sftpMkdirp, sftpStat } from "../ssh/sftp.ts";
+import { mapLimit } from "../util/concurrency.ts";
+import { resolveRemotePath } from "./remotePath.ts";
+import { walkLocal } from "./localWalk.ts";
 
 export type UploadPlan = {
   isDir: boolean;
@@ -21,9 +21,11 @@ function isRemoteDir(stat: any) {
   }
 }
 
-export async function planUpload(client: Client, localPath: string, remotePath: string): Promise<UploadPlan> {
+export async function planUpload(client: Client, localPath: string, remotePath: string, signal?: AbortSignal): Promise<UploadPlan> {
+  signal?.throwIfAborted();
   const st = fs.statSync(localPath);
   const remoteBase = await resolveRemotePath(client, remotePath);
+  signal?.throwIfAborted();
 
   if (st.isFile()) {
     const remoteIsDirHint = remotePath.trim().endsWith("/");
@@ -64,9 +66,10 @@ export async function planUpload(client: Client, localPath: string, remotePath: 
   return { isDir: true, files, dirs, totalBytes };
 }
 
-export async function findUploadConflicts(client: Client, plan: UploadPlan) {
+export async function findUploadConflicts(client: Client, plan: UploadPlan, signal?: AbortSignal) {
   return withSftp(client, async (sftp) => {
     const conflicts = await mapLimit(plan.files, 16, async (f) => {
+      signal?.throwIfAborted();
       const stat = await sftpStat(sftp, f.remote);
       if (!stat) return null;
       // Any existing entry is a conflict, including directories.
@@ -76,13 +79,15 @@ export async function findUploadConflicts(client: Client, plan: UploadPlan) {
   });
 }
 
-export async function performUpload(client: Client, plan: UploadPlan) {
+export async function performUpload(client: Client, plan: UploadPlan, signal?: AbortSignal) {
   return withSftp(client, async (sftp) => {
     for (const d of plan.dirs) {
+      signal?.throwIfAborted();
       await sftpMkdirp(sftp, d);
     }
 
     await mapLimit(plan.files, 4, async (f) => {
+      signal?.throwIfAborted();
       await sftpFastPut(sftp, f.local, f.remote);
     });
 

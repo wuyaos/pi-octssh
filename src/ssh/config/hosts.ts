@@ -1,7 +1,12 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import fg from "fast-glob";
-import { getSshConfigPath } from "./paths.js";
+
+function homeDir() {
+  return process.env.HOME || process.env.USERPROFILE || os.homedir();
+}
+import { getSshConfigPath } from "./paths.ts";
 
 function stripComments(line: string) {
   const idx = line.indexOf("#");
@@ -21,7 +26,7 @@ function expandIncludePattern(pattern: string, baseDir: string) {
   // OpenSSH's Include supports globs. We intentionally do not implement full ssh_config semantics,
   // but we do expand globs to discover host aliases.
   const p = pattern.startsWith("~")
-    ? path.join(process.env.HOME ?? "", pattern.slice(1))
+    ? path.join(homeDir(), pattern.slice(1))
     : pattern;
   const abs = path.isAbsolute(p) ? p : path.join(baseDir, p);
   return fg.sync(abs, { dot: true, onlyFiles: true, unique: true });

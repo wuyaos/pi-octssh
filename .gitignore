@@ -1,5 +1,6 @@
 node_modules/
 dist/
+.pi-subagents/
 npm-debug.log*
 pnpm-debug.log*
 yarn-debug.log*

@@ -1,7 +1,7 @@
 import path from "node:path";
 import { z } from "zod";
-import { atomicWriteFileSync, readJsonIfExistsSync } from "./fs.js";
-import { getOctsshDir } from "./paths.js";
+import { atomicWriteFileSync, readJsonIfExistsSync } from "./fs.ts";
+import { getOctsshDir } from "./paths.ts";
 
 export const configSchema = z
   .object({

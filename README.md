@@ -1,170 +1,92 @@
-# OctSSH
+# pi-octssh
 
-[中文 README](README.zh.md)
+> **Pi 原生 SSH 扩展** — 远程执行、文件传输、异步任务、安全确认。
 
-[![XEnvManager V1.0](https://img.shields.io/badge/XEnvManager-V1.0-blue)](https://github.com/AliyahZombie/XEnvMananger)
+## Fork 来源
 
-<p align="center">This project supports the XEnvManager protocol.</p>
+本项目基于 [`aliyahzombie/OctSSH`](https://github.com/aliyahzombie/OctSSH) 进行 Fork 和 Pi 原生扩展改造。
 
-I was just VibeCoding and suddenly thought: **Why can't I just let my agent deploy code to the server for me?**
+- **上游仓库**:`aliyahzombie/OctSSH`
+- **上游 commit**:`2a2f255`(v0.1.7)
+- **原作者**:`aliyahzombie`
 
-So, I built **OctSSH**.
+### 改造说明
 
-<img src="logo.png" width="200" />
+原项目是一个 MCP Server,通过 stdio / Streamable HTTP 向 MCP 客户端暴露 SSH 工具。本 Fork 的改造方向:
 
-**OctSSH** is an MCP server that gives LLMs **safe, controllable, and stateful** access to shell environments.
+- **移除** MCP Server、MCP stdio、Streamable HTTP、`@modelcontextprotocol/sdk` 依赖;
+- **移除** `confirm_code` 模型可提交的确认机制,改用 Pi `ctx.ui.confirm()` 人工确认;
+- **新增** Pi Extension API 原生工具注册、TUI 安全确认、结果渲染、`/octssh` 管理面板;
+- **新增** 完整的 `AbortSignal`、连接池生命周期、`session_shutdown` 清理;
+- **修复** Windows / Linux / macOS 跨平台兼容问题;
+- **保留** 上游 SSH、ProxyJump、SFTP、远程 `screen` 异步任务、安全策略、状态持久化等核心能力。
 
-### Note
-**By default (stdio mode), OctSSH only connects to machines already configured in your local `ssh_config` for passwordless login.**
+本项目**不是**上游作者的官方发行版本。
 
----
+## 功能
 
-> [!TIP]
-> **So... what makes OctSSH special?**
+### Pi 原生工具
 
-## Async Support
+| 工具 | 作用 |
+|---|---|
+| `octssh_hosts` | 列出 ssh_config 主机、查询主机扩展信息 |
+| `octssh_exec` | 远程命令执行(同步 / 异步 / sudo) |
+| `octssh_transfer` | 文件上传 / 下载(同步 / 异步) |
+| `octssh_session` | 异步任务管理(查询 / 搜索日志 / 写 stdin / 取消) |
 
-OctSSH provides a complete set of async tools to prevent LLMs from timing out on long-running tasks:
+### 安全确认
 
-| Tool | Description |
-|:---|:---|
-| `exec(machine, command, confirm_code?)` | Run short commands synchronously |
-| `sudo-exec(machine, command, confirm_code?)` | Run synchronously as root (`sudo -n`) |
-| `exec-async(machine, command, confirm_code?)` | Run long tasks in background (screen) |
-| `exec-async-sudo(...)` | Run background tasks as root |
-| `write-stdin(session_id, data, append_newline?)` | Write to stdin of a running async task |
-| `get-result(session_id, lines?)` | Inspect async task output |
-| `grep-result(session_id, pattern, ...)` | Search task logs |
-| `cancel(session_id)` | Terminate a task |
-| `sleep(time)` | Pause (useful for polling) |
+高危操作(递归删除、文件覆盖)通过 Pi `ctx.ui.confirm()` 弹窗,由用户人工确认。模型无法自行提交确认码,无 UI 时默认拒绝。
 
-> **Note**: In **HTTP Serve mode**, these tools operate directly on the *local* machine, and the `machine` parameter is omitted.
+### `/octssh` 命令
 
-## Security Design
+打开管理面板:主机列表、连接状态、远程任务、传输进度。
 
-OctSSH features a **Virtual Mode** and **Confirm Code** verification flow:
+## 平台支持
 
-### 🔒 Safety Mechanism: Virtual Mode
+### 客户端(运行 Pi 的机器)
 
-We don't want AI to become a world-ending terminator, so we designed Virtual Mode.
-When the AI attempts the following, OctSSH **will not execute immediately**, but instead returns a `confirm_code`:
+| 平台 | 支持 |
+|---|---|
+| Linux | ✅ |
+| macOS | ✅ |
+| Windows | ✅(pwsh / powershell / cmd / Git Bash) |
 
-- 📁 **File Overwrite**: Uploading to a path that already exists.
-- 💀 **High-Risk Commands**: `rm -rf` and similar "delete everything" commands.
-- 🔍 **Regex Blocklist**: Custom sensitive patterns defined in config.
+### 远端服务器
 
-**Execution Flow Example**:
-1. AI calls `exec("web", "rm -rf /var/www/html")`
-2. 🛑 OctSSH intercepts: Recursive delete detected -> Returns `confirm_code: a1b2c3` + file impact preview.
-3. 👤 User reviews and tells AI: "Confirm execution".
-4. ✅ AI calls `exec("web", "rm -rf /var/www/html", "a1b2c3")` -> Actually executes.
+| 平台 | 同步 exec / SFTP | 异步 screen / sudo |
+|---|---|---|
+| Linux | ✅ | ✅ |
+| macOS | ✅ | ✅(需安装 screen) |
+| FreeBSD | ✅ | ⚠️(需安装 screen) |
+| Windows OpenSSH | ✅ | ❌(不支持 screen / sudo) |
 
-## Quick Start
-
-### Installation
-
-```bash
-npm install -g @aliyahzombie/octssh
-octssh init
-```
-
-### Usage Modes
-
-#### 1. Default Client Mode (stdio)
-Runs locally and controls remote machines via SSH (reads `~/.ssh/config`):
-```bash
-octssh
-```
-
-#### 2. Streamable HTTP Server Mode (Local Control)
-Install this **on the target server**. It exposes the server to LLMs via a secure HTTP interface.
-In this mode, OctSSH controls the **local machine** directly (no outbound SSH).
+## 安装
 
 ```bash
-octssh serve
-```
-- **Default Listen**: `127.0.0.1:8787` (Override via `OCTSSH_SERVE_HOST` / `OCTSSH_SERVE_PORT`)
-- **Auth**: Prints a random key on startup. Clients must send header `X-OctSSH-Key: <key>`.
-  - Set fixed key: `export OCTSSH_SERVE_KEY="my-secret"`
-- **Tool Changes**: Tools run on *this* machine. **`machine` parameter is omitted**. SSH transfer tools (`upload`/`download`) are disabled.
-
-#### Windows notes (serve mode)
-
-On Windows, OctSSH serve will auto-select a local shell in this order:
-
-1) `sh` (if available, e.g. Git-Bash/MSYS)
-2) `pwsh`
-3) `powershell`
-4) `cmd`
-
-Override with:
-
-```bash
-set OCTSSH_SHELL=powershell
+pi install /path/to/pi-octssh
 ```
 
-### Tool Prefix (optional)
+或加入 `~/.pi/agent/settings.json`:
 
-To avoid tool name collisions when you run multiple OctSSH instances, you can prefix all exposed tools:
-
-```bash
-export OCTSSH_TOOL_PREFIX="us1_"
-```
-
-Example: `list` becomes `us1_list`.
-
-### write-stdin (async interactive input)
-
-`write-stdin` lets you send input to a running `exec-async` session.
-
-Typical flow:
-1) Start a long-running command that reads stdin (via `exec-async`)
-2) Send data with `write-stdin(session_id, data)`
-3) Poll output with `get-result(session_id)`
-
-Notes:
-- Default `append_newline` is `true`.
-- Max payload is **64KiB per call**.
-- This is a streaming stdin: **EOF is not sent**. If the program exits on EOF, cancel the session instead.
-- If you set `OCTSSH_TOOL_PREFIX`, tool names are prefixed too (e.g. `us1_write-stdin`).
-
-### MCP Client Configuration
-
-#### General (stdio)
-Add to your MCP client config:
 ```json
 {
-  "mcpServers": {
-    "octssh": {
-      "command": "octssh",
-      "args": []
-    }
-  }
+  "packages": ["git:github.com/wuyaos/pi-octssh"]
 }
 ```
 
-#### Claude Code CLI
-```bash
-claude mcp add octssh -- octssh
-```
+## 配置
 
-#### OpenCode CLI
-```json
-{
-  "mcp": {
-    "octssh": {
-      "type": "local",
-      "command": "octssh",
-      "args": [],
-      "enabled": true
-    }
-  }
-}
-```
-Or:
-```bash
-opencode mcp add octssh --command octssh
-```
+读取标准 `~/.ssh/config`。状态保存在 `~/.octssh/`。
 
-> [!CAUTION]
-> This project connects to real servers (or executes on the local machine). Please carefully review LLM operations. Using this project means you agree that the developer is not responsible for any accidental damage.
+环境变量:
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `OCTSSH_HOME` | `~/.octssh` | 状态目录 |
+| `OCTSSH_SSH_CONFIG` | `~/.ssh/config` | ssh_config 路径 |
+| `OCTSSH_ALLOW_SSH_G` | `false` | 是否用 `ssh -G` 解析连接参数 |
+
+## 致谢
+
+感谢 [`aliyahzombie`](https://github.com/aliyahzombie) 的原项目 OctSSH,本项目在其基础上进行 Pi 原生适配。

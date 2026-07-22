@@ -1,57 +1,49 @@
 {
-  "name": "@aliyahzombie/octssh",
-  "version": "0.1.7",
-  "description": "OctSSH - Make LLMs safely control your servers for deployment (MCP)",
-  "license": "UNLICENSED",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/aliyahzombie/OctSSH.git"
-  },
-  "homepage": "https://github.com/aliyahzombie/OctSSH#readme",
-  "bugs": {
-    "url": "https://github.com/aliyahzombie/OctSSH/issues"
-  },
-  "publishConfig": {
-    "access": "public"
-  },
+  "name": "pi-octssh",
+  "version": "0.1.0",
+  "description": "Pi 原生 SSH 扩展 — 远程执行、文件传输、异步任务、安全确认(fork from aliyahzombie/OctSSH)",
   "keywords": [
-    "mcp",
+    "pi-package",
+    "pi",
+    "pi-extension",
     "ssh",
-    "deployment",
-    "automation",
-    "agent",
-    "llm"
+    "deployment"
   ],
+  "license": "UNLICENSED",
+  "_license_note": "上游 aliyahzombie/OctSSH 为 UNLICENSED。本 Fork 保留上游授权状态,公开发布前需取得上游明确许可。详见 README。",
   "engines": {
-    "node": ">=18"
+    "node": ">=24.0.0"
   },
-  "bin": {
-    "octssh": "dist/index.js"
+  "pi": {
+    "extensions": ["./extensions/*.ts"],
+    "skills": ["./skills"]
   },
-  "main": "dist/index.js",
+  "main": "extensions/octssh.ts",
   "files": [
-    "dist/**",
+    "extensions",
+    "src",
+    "skills",
     "README.md",
     "README.zh.md"
   ],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.25.3",
     "fast-glob": "^3.3.2",
     "ssh2": "^1.16.0",
     "zod": "^3.24.1"
   },
-  "scripts": {
-    "clean": "node scripts/clean-dist.cjs",
-    "build": "npm run clean --silent && tsup",
-    "test": "npm run build --silent && node --test test/index.test.js",
-    "dev": "node dist/index.js",
-    "prepack": "npm run build --silent",
-    "prepublishOnly": "npm test"
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "@earendil-works/pi-tui": { "optional": true },
+    "typebox": { "optional": true }
   },
   "devDependencies": {
-    "@types/node": "^20.11.30",
+    "@types/node": "^22.0.0",
     "@types/ssh2": "^1.11.18",
-    "tsup": "^8.0.0",
     "typescript": "^5.5.0"
   }
 }

@@ -1,9 +1,9 @@
 import os from "node:os";
-import { loadConfig } from "../state/config.js";
-import { getOctsshDir } from "../state/paths.js";
-import { resolveHostConfig } from "./config/resolve.js";
-import { loadFirstPrivateKey } from "./connect.js";
-import type { SshClientParams } from "./connect.js";
+import { loadConfig } from "../state/config.ts";
+import { getOctsshDir } from "../state/paths.ts";
+import { resolveHostConfig } from "./config/resolve.ts";
+import { loadFirstPrivateKey } from "./connect.ts";
+import type { SshClientParams } from "./connect.ts";
 
 export type ProxyJumpSpec = {
   host: string;
@@ -66,12 +66,18 @@ export function planMachineConnection(machine: string) {
   const port = resolved.port ?? 22;
   const username = resolved.user ?? defaultUsername();
 
-  const agent = process.env.SSH_AUTH_SOCK;
+  // Windows 原生 OpenSSH 使用 pageant/named pipe,通常不设 SSH_AUTH_SOCK。
+  // Git Bash / WSL 下仍可能有 SSH_AUTH_SOCK。
+  const agent =
+    process.env.SSH_AUTH_SOCK ||
+    (process.platform === "win32" ? process.env.SSH_AGENT_PID : undefined);
   const privateKey = loadFirstPrivateKey(resolved.identityFiles);
 
   if (!agent && !privateKey) {
     warnings.push(
-      "No SSH agent (SSH_AUTH_SOCK) and no readable IdentityFile found; connection may fail."
+      process.platform === "win32"
+        ? "No SSH agent (SSH_AUTH_SOCK/pageant) and no readable IdentityFile found; connection may fail."
+        : "No SSH agent (SSH_AUTH_SOCK) and no readable IdentityFile found; connection may fail."
     );
   }
 

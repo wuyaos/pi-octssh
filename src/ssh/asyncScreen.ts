@@ -1,9 +1,9 @@
 import crypto from "node:crypto";
 import type { Client } from "ssh2";
-import { runCommand } from "./runCommand.js";
-import { quoteForSh, wrapSh } from "./shell.js";
-import { saveSession } from "../state/sessions.js";
-import { getOctsshDir } from "../state/paths.js";
+import { runCommand } from "./runCommand.ts";
+import { quoteForSh, wrapSh } from "./shell.ts";
+import { saveSession } from "../state/sessions.ts";
+import { getOctsshDir } from "../state/paths.ts";
 
 export type StartAsyncParams = {
   machine: string;
