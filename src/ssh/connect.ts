@@ -13,6 +13,10 @@ export type SshClientParams = {
   privateKey?: string;
   agent?: string;
   readyTimeoutMs?: number;
+  /** OpenSSH ServerAliveInterval, converted to ssh2 milliseconds. */
+  keepaliveIntervalMs?: number;
+  /** OpenSSH ServerAliveCountMax. */
+  keepaliveCountMax?: number;
   signal?: AbortSignal;
 };
 
@@ -74,6 +78,8 @@ export function connectSsh2(params: SshClientParams): Promise<Client> {
       username: params.username,
       readyTimeout: params.readyTimeoutMs ?? 20_000,
     };
+    if (params.keepaliveIntervalMs !== undefined) connectOptions.keepaliveInterval = params.keepaliveIntervalMs;
+    if (params.keepaliveCountMax !== undefined) connectOptions.keepaliveCountMax = params.keepaliveCountMax;
     if (params.sock) connectOptions.sock = params.sock;
     if (params.privateKey) connectOptions.privateKey = params.privateKey;
     if (params.agent) connectOptions.agent = params.agent;

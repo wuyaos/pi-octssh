@@ -8,6 +8,25 @@ export type ConnectionPoolOptions = {
   idleTtlMs: number;
 };
 
+function abortError(): Error {
+  const error = new Error("Connection wait aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function waitForAbortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortError());
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener("abort", onAbort); resolve(value); },
+      (error) => { signal.removeEventListener("abort", onAbort); reject(error); },
+    );
+  });
+}
+
 type Entry<T> = {
   value: T;
   lastUsedAt: number;
@@ -40,16 +59,21 @@ export class ConnectionPool<K, T> {
 
   async get(key: K, signal?: AbortSignal): Promise<ConnectionLease<T>> {
     if (this.closed) throw new Error("Connection pool is closed");
+    if (signal?.aborted) throw abortError();
 
     let entry = this.entries.get(key);
     if (!entry) {
       let pending = this.inflight.get(key);
       if (!pending) {
-        pending = this.createEntry(key, signal);
+        // A connection is shared by every waiter for this key. In particular,
+        // do not pass the first caller's AbortSignal into create(): cancelling
+        // one tool invocation must only stop that invocation's wait, not tear
+        // down the connection other callers are about to use.
+        pending = this.createEntry(key);
         this.inflight.set(key, pending);
         pending.finally(() => this.inflight.delete(key)).catch(() => undefined);
       }
-      entry = await pending;
+      entry = await waitForAbortable(pending, signal);
       if (this.closed) {
         if (this.entries.get(key) === entry) this.entries.delete(key);
         await this.closeFn(entry.value);
@@ -71,9 +95,9 @@ export class ConnectionPool<K, T> {
     };
   }
 
-  private async createEntry(key: K, signal?: AbortSignal): Promise<Entry<T>> {
+  private async createEntry(key: K): Promise<Entry<T>> {
     await this.evictIfNeeded();
-    const value = await this.create(key, signal);
+    const value = await this.create(key);
     const entry: Entry<T> = { value, lastUsedAt: Date.now(), refCount: 0 };
     const raced = this.entries.get(key);
     if (raced) {
@@ -85,10 +109,16 @@ export class ConnectionPool<K, T> {
   }
 
   async close(key: K) {
+    await this.invalidate(key);
+  }
+
+  /** Remove a dead connection without accidentally closing a replacement. */
+  async invalidate(key: K, expectedValue?: T): Promise<boolean> {
     const entry = this.entries.get(key);
-    if (!entry) return;
+    if (!entry || (expectedValue !== undefined && entry.value !== expectedValue)) return false;
     this.entries.delete(key);
     await this.closeFn(entry.value);
+    return true;
   }
 
   async closeAll() {

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Client } from "ssh2";
-import { withSftp, sftpFastPut, sftpMkdirp, sftpStat } from "../ssh/sftp.ts";
+import { getSftp, sftpMkdirp, sftpPut, sftpStat, withSftp } from "../ssh/sftp.ts";
 import { mapLimit } from "../util/concurrency.ts";
 import { resolveRemotePath } from "./remotePath.ts";
 import { walkLocal } from "./localWalk.ts";
@@ -23,7 +23,10 @@ function isRemoteDir(stat: any) {
 
 export async function planUpload(client: Client, localPath: string, remotePath: string, signal?: AbortSignal): Promise<UploadPlan> {
   signal?.throwIfAborted();
-  const st = fs.statSync(localPath);
+  const st = fs.lstatSync(localPath);
+  if (st.isSymbolicLink()) {
+    throw new Error(`Unsupported local path type (symlinks are not allowed): ${localPath}`);
+  }
   const remoteBase = await resolveRemotePath(client, remotePath);
   signal?.throwIfAborted();
 
@@ -79,18 +82,29 @@ export async function findUploadConflicts(client: Client, plan: UploadPlan, sign
   });
 }
 
-export async function performUpload(client: Client, plan: UploadPlan, signal?: AbortSignal) {
-  return withSftp(client, async (sftp) => {
+export async function performUpload(
+  client: Client,
+  plan: UploadPlan,
+  signal?: AbortSignal,
+  onFileComplete?: (file: UploadPlan["files"][number]) => void,
+) {
+  const sftp = await getSftp(client);
+  try {
+    // Directories are created once per plan. Each file gets its own SFTP
+    // channel, because concurrently piping multiple read/write streams through
+    // one ssh2 SFTP channel is not safe; this still avoids recreating dirs and
+    // lets every file observe cancellation while in progress.
     for (const d of plan.dirs) {
       signal?.throwIfAborted();
       await sftpMkdirp(sftp, d);
     }
-
-    await mapLimit(plan.files, 4, async (f) => {
+    for (const f of plan.files) {
       signal?.throwIfAborted();
-      await sftpFastPut(sftp, f.local, f.remote);
-    });
-
+      await sftpPut(sftp, f.local, f.remote, signal);
+      onFileComplete?.(f);
+    }
     return { files: plan.files.length, bytes: plan.totalBytes };
-  });
+  } finally {
+    try { sftp.end?.(); } catch { /* ignore channel teardown errors */ }
+  }
 }

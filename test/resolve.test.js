@@ -3,85 +3,60 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { loadTs } = require('./helpers/load-ts.cjs');
 
-test('resolveHostConfig applies ssh_config blocks in file order (first value wins)', () => {
+function writeConfig(lines) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'octssh-resolve-'));
   const configPath = path.join(tmp, 'config');
+  fs.writeFileSync(configPath, lines.join('\n'), 'utf8');
+  return { tmp, configPath };
+}
 
-  fs.writeFileSync(
-    configPath,
-    [
-      'Host foo',
-      '  HostName foo.example.com',
-      '  User alice',
-      '  Port 2222',
-      '  IdentityFile ~/.ssh/id_ed25519',
-      '',
-      // Defaults at the bottom should only apply if not already set.
-      'Host *',
-      '  User defaultUser',
-      '  Port 22',
-      ''
-    ].join('\n'),
-    'utf8'
-  );
-
-  const mod = require('../dist/ssh/config/resolve.js');
-  const cfg = mod.resolveHostConfig('foo', { configPath, allowSshG: false });
+test('resolveHostConfig applies ssh_config blocks in file order (first value wins)', async () => {
+  const { resolveHostConfig } = await loadTs('ssh/config/resolve.ts');
+  const { configPath } = writeConfig([
+    'Host foo',
+    '  HostName foo.example.com',
+    '  User alice',
+    '  Port 2222',
+    '  IdentityFile ~/.ssh/id_ed25519',
+    '',
+    'Host *',
+    '  User defaultUser',
+    '  Port 22',
+    '',
+  ]);
+  const cfg = resolveHostConfig('foo', { configPath, allowSshG: false });
   assert.equal(cfg.hostName, 'foo.example.com');
   assert.equal(cfg.user, 'alice');
   assert.equal(cfg.port, 2222);
   assert.deepEqual(cfg.identityFiles, ['~/.ssh/id_ed25519']);
 });
 
-test('resolveHostConfig supports Include and ProxyCommand warning', () => {
+test('resolveHostConfig supports Include and ProxyCommand warning', async () => {
+  const { resolveHostConfig } = await loadTs('ssh/config/resolve.ts');
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'octssh-resolve-'));
   const confDir = path.join(tmp, 'conf.d');
   fs.mkdirSync(confDir, { recursive: true });
-
   const configPath = path.join(tmp, 'config');
-  const inc = path.join(confDir, 'x.conf');
-
-  fs.writeFileSync(
-    inc,
-    [
-      'Host bar',
-      '  HostName bar.internal',
-      '  ProxyCommand ssh -W %h:%p jump',
-      ''
-    ].join('\n'),
-    'utf8'
-  );
-
-  fs.writeFileSync(
-    configPath,
-    ['Include conf.d/*.conf', ''].join('\n'),
-    'utf8'
-  );
-
-  const mod = require('../dist/ssh/config/resolve.js');
-  const cfg = mod.resolveHostConfig('bar', { configPath, allowSshG: false });
+  fs.writeFileSync(path.join(confDir, 'x.conf'), 'Host bar\n  HostName bar.internal\n  ProxyCommand ssh -W %h:%p jump\n', 'utf8');
+  fs.writeFileSync(configPath, 'Include conf.d/*.conf\n', 'utf8');
+  const cfg = resolveHostConfig('bar', { configPath, allowSshG: false });
   assert.equal(cfg.hostName, 'bar.internal');
-  assert.ok(cfg.warnings.some((w) => w.toLowerCase().includes('proxycommand')));
+  assert.ok(cfg.warnings.some((warning) => warning.toLowerCase().includes('proxycommand')));
 });
 
-test('resolveHostConfig matches patterns with negation', () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'octssh-resolve-'));
-  const configPath = path.join(tmp, 'config');
+test('resolveHostConfig parses ServerAlive settings', async () => {
+  const { resolveHostConfig } = await loadTs('ssh/config/resolve.ts');
+  const { configPath } = writeConfig(['Host keepalive', '  ServerAliveInterval 15', '  ServerAliveCountMax 4']);
+  const cfg = resolveHostConfig('keepalive', { configPath, allowSshG: false });
+  assert.equal(cfg.serverAliveInterval, 15);
+  assert.equal(cfg.serverAliveCountMax, 4);
+});
 
-  fs.writeFileSync(
-    configPath,
-    [
-      'Host *.prod !bad.prod',
-      '  User prodUser',
-      ''
-    ].join('\n'),
-    'utf8'
-  );
-
-  const mod = require('../dist/ssh/config/resolve.js');
-  const ok = mod.resolveHostConfig('good.prod', { configPath, allowSshG: false });
-  const bad = mod.resolveHostConfig('bad.prod', { configPath, allowSshG: false });
-  assert.equal(ok.user, 'prodUser');
-  assert.equal(bad.user, undefined);
+test('resolveHostConfig matches patterns with negation', async () => {
+  const { resolveHostConfig } = await loadTs('ssh/config/resolve.ts');
+  const { configPath } = writeConfig(['Host *.prod !bad.prod', '  User prodUser']);
+  assert.equal(resolveHostConfig('good.prod', { configPath, allowSshG: false }).user, 'prodUser');
+  assert.equal(resolveHostConfig('bad.prod', { configPath, allowSshG: false }).user, undefined);
 });

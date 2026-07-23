@@ -87,6 +87,8 @@ export function planMachineConnection(machine: string) {
     username,
     agent,
     privateKey,
+    ...(resolved.serverAliveInterval !== undefined ? { keepaliveIntervalMs: resolved.serverAliveInterval * 1000 } : {}),
+    ...(resolved.serverAliveCountMax !== undefined ? { keepaliveCountMax: resolved.serverAliveCountMax } : {}),
   };
 
   if (!resolved.proxyJump) {
@@ -108,6 +110,8 @@ export function planMachineConnection(machine: string) {
     username: jumpUser,
     agent,
     privateKey: jumpKey,
+    ...(jumpResolved.serverAliveInterval !== undefined ? { keepaliveIntervalMs: jumpResolved.serverAliveInterval * 1000 } : {}),
+    ...(jumpResolved.serverAliveCountMax !== undefined ? { keepaliveCountMax: jumpResolved.serverAliveCountMax } : {}),
   };
 
   return { target, jump, warnings } satisfies MachineConnectPlan;

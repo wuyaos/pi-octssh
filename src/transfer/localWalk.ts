@@ -9,8 +9,16 @@ export type LocalEntry = {
   size: number;
 };
 
+function assertRegularFileOrDirectory(entryPath: string): fs.Stats {
+  const stats = fs.lstatSync(entryPath);
+  if (stats.isSymbolicLink() || (!stats.isFile() && !stats.isDirectory())) {
+    throw new Error(`Unsupported local path type (symlinks are not allowed): ${entryPath}`);
+  }
+  return stats;
+}
+
 export function walkLocal(rootPath: string): LocalEntry[] {
-  const st = fs.statSync(rootPath);
+  const st = assertRegularFileOrDirectory(rootPath);
   if (st.isFile()) {
     return [
       {
@@ -33,7 +41,7 @@ export function walkLocal(rootPath: string): LocalEntry[] {
     for (const name of fs.readdirSync(dir)) {
       const abs = path.join(dir, name);
       const rel = path.relative(base, abs).split(path.sep).join("/");
-      const s = fs.statSync(abs);
+      const s = assertRegularFileOrDirectory(abs);
       if (s.isDirectory()) {
         entries.push({ absPath: abs, relPath: rel, isFile: false, isDir: true, size: 0 });
         walk(abs);

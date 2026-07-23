@@ -95,7 +95,14 @@ class Runtime implements OctsshRuntime {
           ? await connectWithProxyJump({ jump: { ...plan.jump, signal }, target: { ...plan.target, signal }, signal })
           : await connectDirect({ ...plan.target, signal });
         const platform = await detectRemotePlatform(ssh.client, signal);
-        return { ssh, warnings: plan.warnings, platform };
+        const connection: MachineConnection = { ssh, warnings: plan.warnings, platform };
+        // connectSsh2 keeps an error listener to prevent ssh2 EventEmitter
+        // crashes. Pooling must additionally discard that client: otherwise a
+        // disconnected socket remains reusable until its idle TTL expires.
+        const invalidate = () => { void this.pool.invalidate(machine, connection).catch(() => undefined); };
+        ssh.client.on("error", invalidate);
+        ssh.client.on("close", invalidate);
+        return connection;
       },
       close: (value) => value.ssh.end(),
       options: { maxConnections: this.cfg.maxConnections, idleTtlMs: this.cfg.idleTtlSeconds * 1000 },

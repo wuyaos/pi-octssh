@@ -10,9 +10,13 @@
     "deployment"
   ],
   "license": "UNLICENSED",
-  "_license_note": "上游 aliyahzombie/OctSSH 为 UNLICENSED。本 Fork 保留上游授权状态,公开发布前需取得上游明确许可。详见 README。",
   "engines": {
     "node": ">=24.0.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.js",
+    "check": "npm run typecheck && npm test"
   },
   "pi": {
     "extensions": ["./extensions/*.ts"],
@@ -42,8 +46,11 @@
     "typebox": { "optional": true }
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.81.1",
+    "@earendil-works/pi-tui": "^0.81.1",
     "@types/node": "^22.0.0",
     "@types/ssh2": "^1.11.18",
+    "typebox": "^1.3.6",
     "typescript": "^5.5.0"
   }
 }

@@ -47,26 +47,22 @@ type Common = { client: Client; machine: string; localPath: string; remotePath: 
 export function startUploadAsync(params: Common & { plan: UploadPlan }) {
   return startTransfer("upload", params, async (abort, sessionId, baseDir) => {
     let done = 0;
-    for (const file of params.plan.files) {
-      abort.signal.throwIfAborted();
-      appendLog(sessionId, `put ${file.local} -> ${file.remote}`, baseDir);
-      await performUpload(params.client, { ...params.plan, files: [file], totalBytes: file.size, dirs: params.plan.dirs }, abort.signal);
+    for (const file of params.plan.files) appendLog(sessionId, `put ${file.local} -> ${file.remote}`, baseDir);
+    await performUpload(params.client, params.plan, abort.signal, (file) => {
       done += file.size ?? 0;
       setTransferSession({ session_id: sessionId, bytesDone: done } as any, baseDir);
-    }
+    });
     return done;
   }, params.plan.totalBytes);
 }
 export function startDownloadAsync(params: Common & { plan: DownloadPlan }) {
   return startTransfer("download", params, async (abort, sessionId, baseDir) => {
     let done = 0;
-    for (const file of params.plan.files) {
-      abort.signal.throwIfAborted();
-      appendLog(sessionId, `get ${file.remote} -> ${file.local}`, baseDir);
-      await performDownload(params.client, { ...params.plan, files: [file], totalBytes: file.size, dirs: params.plan.dirs }, abort.signal);
+    for (const file of params.plan.files) appendLog(sessionId, `get ${file.remote} -> ${file.local}`, baseDir);
+    await performDownload(params.client, params.plan, abort.signal, (file) => {
       done += file.size ?? 0;
       setTransferSession({ session_id: sessionId, bytesDone: done } as any, baseDir);
-    }
+    });
     return done;
   }, params.plan.totalBytes);
 }

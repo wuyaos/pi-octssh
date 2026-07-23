@@ -1,3 +1,6 @@
+import crypto from "node:crypto";
+import fs from "node:fs";
+import { pipeline } from "node:stream/promises";
 import type { Client } from "ssh2";
 
 export type SftpClient = any;
@@ -25,25 +28,49 @@ export async function withSftp<T>(client: Client, fn: (sftp: SftpClient) => Prom
   }
 }
 
+function isSftpNotFound(error: any): boolean {
+  // ssh2 exposes SFTP status codes via `code`; SSH_FX_NO_SUCH_FILE is 2.
+  return error?.code === 2 || error?.code === "ENOENT" || error?.code === "ENOTDIR";
+}
+
+function isSftpAlreadyExists(error: any): boolean {
+  // Servers commonly return SSH_FX_FAILURE (4) for mkdir of an existing path,
+  // so prove existence with stat instead of swallowing every failure.
+  return error?.code === 11 || error?.code === "EEXIST";
+}
+
 export async function sftpStat(sftp: SftpClient, p: string): Promise<any | null> {
   return new Promise((resolve, reject) => {
     sftp.stat(p, (err: any, stats: any) => {
-      if (err) {
-        // ssh2 uses numeric errno codes; treat any error as non-existence for our use.
-        resolve(null);
-        return;
-      }
-      resolve(stats);
+      if (!err) return resolve(stats);
+      if (isSftpNotFound(err)) return resolve(null);
+      reject(err);
     });
   });
 }
 
 export async function sftpMkdir(sftp: SftpClient, p: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    sftp.mkdir(p, (err: any) => {
+    sftp.mkdir(p, async (err: any) => {
       if (!err) return resolve();
-      // Ignore "exists" errors.
-      resolve();
+      if (!isSftpAlreadyExists(err)) {
+        // Some servers use SSH_FX_FAILURE for an existing directory. Verify
+        // that narrow exception; permission/network failures remain visible.
+        try {
+          const stat = await sftpStat(sftp, p);
+          if (stat?.isDirectory?.()) return resolve();
+        } catch (statError) {
+          return reject(statError);
+        }
+        return reject(err);
+      }
+      try {
+        const stat = await sftpStat(sftp, p);
+        if (stat?.isDirectory?.()) return resolve();
+      } catch (statError) {
+        return reject(statError);
+      }
+      reject(err);
     });
   });
 }
@@ -67,20 +94,48 @@ export async function sftpReaddir(sftp: SftpClient, p: string): Promise<any[]> {
   });
 }
 
-export async function sftpFastPut(sftp: SftpClient, localPath: string, remotePath: string) {
-  return new Promise<void>((resolve, reject) => {
-    sftp.fastPut(localPath, remotePath, (err: any) => {
-      if (err) reject(err);
-      else resolve();
-    });
-  });
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    const error = new Error("SFTP transfer aborted");
+    error.name = "AbortError";
+    throw error;
+  }
 }
 
-export async function sftpFastGet(sftp: SftpClient, remotePath: string, localPath: string) {
-  return new Promise<void>((resolve, reject) => {
-    sftp.fastGet(remotePath, localPath, (err: any) => {
-      if (err) reject(err);
-      else resolve();
-    });
-  });
+/**
+ * Stream one upload so AbortSignal can destroy the in-flight streams. ssh2's
+ * fastPut/fastGet cannot be cancelled once started, which left a supposedly
+ * cancelled async transfer running in the background.
+ */
+export async function sftpPut(sftp: SftpClient, localPath: string, remotePath: string, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  const source = fs.createReadStream(localPath);
+  const destination = sftp.createWriteStream(remotePath);
+  try {
+    await pipeline(source, destination, { signal });
+  } finally {
+    source.destroy();
+    destination.destroy?.();
+  }
+}
+
+/**
+ * Stream a download into a sibling temporary file and rename it only after the
+ * full transfer succeeds. An abort/error therefore never exposes a truncated
+ * destination file as a successful download.
+ */
+export async function sftpGet(sftp: SftpClient, remotePath: string, localPath: string, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  const partialPath = `${localPath}.octssh-part-${crypto.randomUUID()}`;
+  const source = sftp.createReadStream(remotePath);
+  const destination = fs.createWriteStream(partialPath, { flags: "wx" });
+  try {
+    await pipeline(source, destination, { signal });
+    throwIfAborted(signal);
+    fs.renameSync(partialPath, localPath);
+  } finally {
+    source.destroy?.();
+    destination.destroy();
+    fs.rmSync(partialPath, { force: true });
+  }
 }
