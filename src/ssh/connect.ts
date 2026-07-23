@@ -39,27 +39,34 @@ export function connectSsh2(params: SshClientParams): Promise<Client> {
   return new Promise((resolve, reject) => {
     const client = new Client();
     let settled = false;
-    const cleanup = () => {
-      client.removeAllListeners("ready");
-      client.removeAllListeners("error");
-      params.signal?.removeEventListener("abort", onAbort);
-    };
-    const fail = (error: Error) => {
+    // Permanent error sink. ssh2 emits trailing "Connection lost before
+    // handshake" (fatal, level 'protocol') during teardown when the socket
+    // connected but no SSH banner was received, and may emit other protocol /
+    // keepalive errors on pooled connections. An emitted 'error' with no
+    // listener becomes an uncaughtException and crashes the host process, so
+    // a listener must remain attached for the client's whole lifetime.
+    const onError = (error: Error) => {
       if (settled) return;
       settled = true;
-      cleanup();
+      client.removeAllListeners("ready");
+      params.signal?.removeEventListener("abort", onAbort);
       try { client.end(); } catch { /* ignore */ }
       reject(error);
     };
-    const onAbort = () => fail(abortError());
+    const onAbort = () => onError(abortError());
     params.signal?.addEventListener("abort", onAbort, { once: true });
     client.on("ready", () => {
       if (settled) return;
       settled = true;
-      cleanup();
+      client.removeAllListeners("ready");
+      params.signal?.removeEventListener("abort", onAbort);
+      // Swap the connect-phase handler for a permanent sink so late errors on
+      // a pooled connection never escape as uncaughtExceptions.
+      client.removeListener("error", onError);
+      client.on("error", () => { /* connection-level error; handled per-op */ });
       resolve(client);
     });
-    client.on("error", fail);
+    client.on("error", onError);
 
     const connectOptions: any = {
       host: params.host ?? "127.0.0.1",
