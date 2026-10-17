@@ -29,7 +29,7 @@ function expandIncludePattern(pattern: string, baseDir: string) {
     ? path.join(homeDir(), pattern.slice(1))
     : pattern;
   const abs = path.isAbsolute(p) ? p : path.join(baseDir, p);
-  return fg.sync(abs, { dot: true, onlyFiles: true, unique: true });
+  return fg.sync(abs.split(path.sep).join("/"), { dot: true, onlyFiles: true, unique: true });
 }
 
 function readFileLines(filePath: string) {

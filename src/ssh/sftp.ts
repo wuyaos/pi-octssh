@@ -139,3 +139,90 @@ export async function sftpGet(sftp: SftpClient, remotePath: string, localPath: s
     fs.rmSync(partialPath, { force: true });
   }
 }
+
+/**
+ * `lstat`：不跟随符号链接。attr 只有 v3 的 mode/uid/gid/size/atime/mtime，
+ * 没有 inode/nlink——那两项只能从远端 `stat` 拿（见 remote/fingerprint.ts）。
+ */
+export async function sftpLstat(sftp: SftpClient, p: string): Promise<any | null> {
+  return new Promise((resolve, reject) => {
+    sftp.lstat(p, (err: any, stats: any) => {
+      if (!err) return resolve(stats);
+      if (isSftpNotFound(err)) return resolve(null);
+      reject(err);
+    });
+  });
+}
+
+/**
+ * 以 `wx` 独占创建并写入完整字节。目标已存在时抛可识别的 EEXIST 错误，
+ * 绝不覆盖——编辑流程靠这一点防止并发覆盖别人的文件。
+ */
+export async function sftpWriteExclusive(
+  sftp: SftpClient,
+  remotePath: string,
+  bytes: Buffer,
+  mode?: number,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const options: Record<string, unknown> = { flags: "wx" };
+    if (mode !== undefined) options.mode = mode;
+    sftp.open(remotePath, options, (err: any, handle: Buffer) => {
+      if (err) return reject(err);
+      let offset = 0;
+      const writeNext = () => {
+        if (offset >= bytes.length) {
+          return sftp.close(handle, (closeErr: any) => (closeErr ? reject(closeErr) : resolve()));
+        }
+        const chunk = bytes.subarray(offset, Math.min(offset + 32 * 1024, bytes.length));
+        sftp.write(handle, chunk, 0, chunk.length, offset, (writeErr: any) => {
+          if (writeErr) {
+            return sftp.close(handle, () => reject(writeErr));
+          }
+          offset += chunk.length;
+          writeNext();
+        });
+      };
+      writeNext();
+    });
+  });
+}
+
+/** `posix-rename@openssh.com` 扩展：原子替换。服务器不支持时抛 `POSIX_RENAME_UNSUPPORTED`。 */
+export async function posixRename(sftp: SftpClient, from: string, to: string): Promise<void> {
+  if (typeof sftp.ext_openssh_rename !== "function") {
+    const error = new Error("SFTP server does not advertise posix-rename@openssh.com");
+    (error as NodeJS.ErrnoException).code = "POSIX_RENAME_UNSUPPORTED";
+    throw error;
+  }
+  await new Promise<void>((resolve, reject) => {
+    sftp.ext_openssh_rename(from, to, (err: any) => {
+      if (!err) return resolve();
+      if (err.code === 8 || /unsupported/i.test(String(err.message ?? ""))) {
+        const error = new Error("SFTP server does not support posix-rename@openssh.com");
+        (error as NodeJS.ErrnoException).code = "POSIX_RENAME_UNSUPPORTED";
+        return reject(error);
+      }
+      reject(err);
+    });
+  });
+}
+
+/** `setstat` 的 atime/mtime（秒）。保留原有 mode/uid/gid 不变。 */
+export async function setTimes(sftp: SftpClient, p: string, atime: number, mtime: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    sftp.utimes(p, atime, mtime, (err: any) => (err ? reject(err) : resolve()));
+  });
+}
+
+export async function sftpChmod(sftp: SftpClient, p: string, mode: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    sftp.chmod(p, mode, (err: any) => (err ? reject(err) : resolve()));
+  });
+}
+
+export async function sftpChown(sftp: SftpClient, p: string, uid: number, gid: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    sftp.chown(p, uid, gid, (err: any) => (err ? reject(err) : resolve()));
+  });
+}

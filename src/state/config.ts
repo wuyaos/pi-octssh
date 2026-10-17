@@ -12,6 +12,20 @@ export const configSchema = z
     maxConnections: z.number().int().min(1).max(500).default(10),
     allowSshG: z.boolean().default(false),
 
+    // 任务完成通知：是否允许主动开启新回合唤醒模型。
+    // 关闭后仍记录状态与面板可见性，只是不再自动开新回合。
+    taskNotify: z
+      .object({
+        autoWake: z.boolean().default(true),
+        // 扫描周期（秒）。默认 2 分钟：够快，又不至于频繁握手。
+        sweepIntervalSeconds: z.number().int().min(30).max(3600).default(120),
+        // 已投递记录的保留参数
+        deliveredRetentionDays: z.number().int().min(1).max(365).default(30),
+        deliveredMaxEntries: z.number().int().min(100).max(100_000).default(5000),
+      })
+      .strict()
+      .default({} as any),
+
     // Streamable HTTP MCP server mode (octssh serve)
     httpServer: z
       .object({

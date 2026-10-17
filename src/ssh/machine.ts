@@ -4,6 +4,7 @@ import { getOctsshDir } from "../state/paths.ts";
 import { resolveHostConfig } from "./config/resolve.ts";
 import { loadFirstPrivateKey } from "./connect.ts";
 import type { SshClientParams } from "./connect.ts";
+import type { SshIdentity } from "../security/identity.ts";
 
 export type ProxyJumpSpec = {
   host: string;
@@ -115,4 +116,24 @@ export function planMachineConnection(machine: string) {
   };
 
   return { target, jump, warnings } satisfies MachineConnectPlan;
+}
+
+/**
+ * 从连接计划推导身份，不建立任何连接。
+ *
+ * 复用 `planMachineConnection` 的解析结果（含 ssh_config 的 HostName/User/Port
+ * 与跳板推导），但只返回纯数据，供信任表与授权摘要使用。
+ */
+export function resolveIdentity(machine: string): SshIdentity {
+  const plan = planMachineConnection(machine);
+  const identity: SshIdentity = {
+    alias: machine,
+    host: plan.target.host,
+    port: plan.target.port,
+    user: plan.target.username,
+  };
+  if (plan.jump) {
+    identity.jump = { host: plan.jump.host, port: plan.jump.port, user: plan.jump.username };
+  }
+  return identity;
 }

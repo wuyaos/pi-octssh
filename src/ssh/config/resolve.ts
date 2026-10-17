@@ -57,7 +57,7 @@ function expandIncludePattern(pattern: string, baseDir: string) {
     : pattern;
   const abs = path.isAbsolute(p) ? p : path.join(baseDir, p);
 
-  const matches = fg.sync(abs, { dot: true, onlyFiles: true, unique: true });
+  const matches = fg.sync(abs.split(path.sep).join("/"), { dot: true, onlyFiles: true, unique: true });
   matches.sort();
   return matches;
 }

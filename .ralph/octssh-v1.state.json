@@ -1,0 +1,15 @@
+{
+  "name": "octssh-v1",
+  "taskFile": ".ralph\\octssh-v1.md",
+  "iteration": 20,
+  "maxIterations": 20,
+  "itemsPerIteration": 1,
+  "reflectEvery": 3,
+  "reflectInstructions": "REFLECTION CHECKPOINT\n\nPause and reflect on your progress:\n1. What has been accomplished so far?\n2. What's working well?\n3. What's not working or blocking progress?\n4. Should the approach be adjusted?\n5. What are the next priorities?\n\nUpdate the task file with your reflection, then continue working.",
+  "active": false,
+  "status": "completed",
+  "startedAt": "2026-10-17T18:03:16.933Z",
+  "lastReflectionAt": 19,
+  "ownerSessionId": "01a14add-4e0c-71ed-a1d5-1eaf3b3a4162",
+  "completedAt": "2026-10-17T23:52:03.030Z"
+}

@@ -1,0 +1,267 @@
+# pi-octssh 六项功能实施
+
+## Goals
+按已确认规格实施：独立远端读取/可靠编辑、SSH 密码与私钥口令遮罩输入、项目持久权限、目标/跳板主机密钥验证、异步完成通知、轻量任务面板。主线程负责契约/编排/验收，coder 实现。保留既有工作区修改，不提交、不覆盖。用户只授权实现，未授权访问现有远端或生产写入；真实路径优先用隔离本地 SSH fixture，外部验证需授权。
+
+## Contract
+- 本地工具不切换，machine/path 显式。无 PTY/端口转发/全工作区/sudo 密码/多轮认证/关键词通知/沙箱。
+- 项目身份采用 canonical Git worktree 根（非 Git 为启动目录）；不简单小写路径；移动/worktree 不继承。身份由宿主注入，不能由模型指定。
+- 远端身份含实际 host/port/user/跳板路线/验证公钥；别名重定向不得复用授权或连接。信任独立用户侧 known-hosts.json，首次人工确认、变化阻止；无 UI 未知拒绝。
+- 密码/passphrase 只人工遮罩输入、不进模型/日志/磁盘，仅进程内缓存可清除；同对象请求合并、全局串行弹窗；取消停止，错误失效，不无限重试。后台探测不可主动弹框。
+- 用户侧按项目存 allow/deny/ask。受管 read/edit/upload/download/exec/session 入口统一裁决。内建硬禁止和坏配置拒绝，项目 deny>ask>allow，未匹配沿用现有策略。sync/async 不绕过，sudo 独立条件。精确命令+cwd，精确文件或目录子树段边界。四选项人工确认和 permissions 管理。不是资源级隔离。
+- octssh_read(machine,path,offset?,limit?) / octssh_edit(machine,path,expectedVersion REQUIRED,oldText,newText,dryRun?)。`expectedVersion` 为不透明 token 且自带保证等级：强指纹 `v1i`（inode/链接数/uid/gid/mode/size/mtime，来自固定 `stat` 模板）才允许 edit；弱指纹 `v1w`（仅 size/mtime/mode/type）仅供 read 使用并标注弱，edit 拿到弱指纹返回 `unsupported`，不得降级充当 CAS。首版有界 2 MiB UTF-8 普通文件，BOM/未修改字节保留，无隐式换行转换；空或非唯一 oldText 拒绝。符号链接、特殊元数据/硬链接无法安全识别保留等明确拒绝，不静默降级；`chown` 无法复原（非特权 uid）时拒绝，不能只保 mode 静默通过。
+- SFTP 内容传输；同目录独占 temp，版本多次核验，安全原子替换、回读、bounded diff；保留 mode/约定 owner，mtime 正常更新；无原子替换能力拒绝。返回 success/conflict/unsupported/not_written/outcome_unknown/blocked；不确定不盲重试。非外部写者 CAS，不虚假保证。通用上传仍原语义。
+- 强指纹由固定远端元数据模板取得（GNU `stat -c`、BSD `stat -f` 两套常量，路径仅经 `quoteForSh`），不把内容并入命令；平台选择复用 `detectRemotePlatform` 缓存结果；模板不可用时该主机不支持 edit。SFTP v3 attrs 无 inode/nlink，因此拒绝硬链接靠的是 `stat` 而不是 SFTP 自身。rename 用 `posix-rename@openssh.com`（ssh2 在不支持时抛错，正好可作能力探测），不支持即 `unsupported`。最后一次核验到 rename 之间存在 TOCTOU 窗口，文档与错误信息必须原样写明
+- task state running/cancelling/done/failed/cancelled/interrupted；observation reachable/unknown 分离。screen Pi 退出继续，transfer 无自动续传。owner 含进程实例，旧归属不猜；取消以真实终态为准。
+- 通知稳定 eventId、用户侧持久交付记录/多进程单观察者，正常去重、崩溃可识别重复非 exactly once。默认自动唤醒当前所属项目 idle 会话，忙时排队，关唤醒仍 UI+面板。默认仅状态元数据无原始日志/命令；无合适会话等待，重启补报，unknown 不当完成。
+- /octssh tasks 按需面板，当前项目默认可看全部，详情/日志/取消仍授权，关闭停止面板刷新。
+- 状态写入安全并发/迁移，锁不可仅以超 30s 抢占；规则坏拒绝、不自动用可能缺最新 deny 的备份。
+
+## Checklist
+- [x] P0 基线：prod/dev 依赖缺失，已 `npm ci`（`package-lock.json` 未变；`ssh2` install script 被 npm allowScripts 门拦住，走纯 JS 路径）；`npm run typecheck` 退出码 0；`npm test` 22 项 21 通过 1 失败（`test/transfer.test.js` symlink `EPERM`，Windows 非管理员/未开 Developer Mode 环境限制，非代码缺陷）。修复阻断基线的 fast-glob 分隔符缺陷（`src/ssh/config/hosts.ts`、`src/ssh/config/resolve.ts` 的 Include 展开在 Windows 用反斜杠模式命中 0 个文件，改为 `/`），两个 Include 测试转通过
+- [x] P0 能力核实（静态取证完成，见 Verification；实连项待 fixture）：SFTP v3 无 inode/nlink、`posix-rename` 不支持时抛错、`wx` 独占创建、`lstat` 可用；ssh2 `hostVerifier(key, verify)` 回调可异步且不设 `hostHash` 时拿到原始公钥字节；`passphrase` 配置项存在；`authHandler(authsLeft, partialSuccess, cb)` 可异步且能看服务器剩余方法（识别仅 keyboard-interactive）；`pi-tui` 两版 `Input` 均无 mask，`ctx.ui.custom` 支持 overlay；`ctx.mode/hasUI/isIdle/sendMessage(triggerTurn|deliverAs)` 两版皆有
+- [x] P0 契约定稿 + 设计笔记：`.agents/notes/proposed/architecture/2026-10-17-octssh-v1-contract.md`（6 组契约 + 8 条放弃选项 + 验收口径 + 风险）
+- [x] P1a 身份与主机信任：`src/security/identity.ts`、`src/ssh/hostVerifier.ts`、`src/state/hostTrust.ts` 新增；`resolveIdentity()`/连接层错误分类/`/octssh trust` 接入（离线行为已验，见 Verification；真机对拍待 fixture）
+- [x] P1b 凭据：`src/tui/secretPrompt.ts`（遮罩组件）、`src/ssh/credentials.ts`（缓存/合并/串行/失效/清除）、`src/ssh/connect.ts` 认证回调（passphrase、`AUTH_UNSUPPORTED`、`AUTH_REQUIRES_UI`、密码 2 次上限）、runtime + `/octssh credentials clear` 接入；离线语义已验（见 Verification），真机项待 fixture
+- [x] P2a 裁决内核：`src/security/project.ts`（项目身份）、`src/util/lockfile.ts`（独占锁，仅同机 ESRCH 才接管）、`src/security/rules.ts`（项目规则存储 + fail-closed）、`src/security/evaluate.ts`（deny>ask>allow 纯函数）；离线语义已验（见 Verification）
+- [x] P2b 入口接入：`src/security/authorize.ts` 新增（请求↔规则双向映射、`builtinBlockFromGuard` 只做 block→deny 不重抄清单）；runtime 全部受管入口接裁决（deny 在建连前判定；guard `block` 永远优先于项目 allow；命中 ask 也强制确认）；扩展层四选项 `ctx.ui.select`（范围并入标题、超 10 文件不给「始终」）；`/octssh permissions [remove <id>]` 人工入口；`projectId` 从 `ctx.cwd` 推导、工具 schema 无此参数（模型不可提供）。离线回放性质已验（见 Verification）
+- [x] P3a 指纹与编辑规划：`src/remote/fingerprint.ts`（不透明 token、强/弱保证等级、GNU/BSD 两套 `stat -c '%i|%h'`/`stat -f '%i|%l'` 模板 + `quoteForSh`、解析区分「模板不适用」与「字段不可解析」）、`src/remote/editPlan.ts`（严格 UTF-8 + BOM + 有界 diff + 逐字节替换）、`src/ssh/sftp.ts` 纯追加 6 个原语（`sftpLstat`/`wx` 独占写/`posixRename`/`setTimes`/`chmod`/`chown`，现有函数零改动）。纯逻辑离线性质已验（见 Verification）；真机清单 8 项在 `.ralph/handoff/P3a.md`
+- [x] P3b-1 写入编排：`src/remote/applyEdit.ts`（依赖注入的 `RemoteFileOps` seam、六种结果 + `no_change`/`dry_run`、固定操作顺序、空操作短路）、`src/remote/sftpFileOps.ts`（只转发的真适配器）。**11 项结果语义与调用顺序全部用假适配器离线验满**（见 Verification）
+- [x] P3b-2 工具与 runtime：`src/remote/readFile.ts` 新增（同一套依赖注入：`fileOps` + `statProbe`，行窗口只影响展示、token 始终覆盖整份文件、模板不可用 → 弱 token + 警告）；`octssh_read`/`octssh_edit` 注册（schema 无 `projectId`、`expectedVersion` 必填）；runtime `readFile`/`editFile`（deny 在建连前、命中 ask 才弹窗、命中 allow 跳过确认但版本校验照旧、`outcome_unknown` 文案明确「不要重试，先重新读取核对」）。离线性质已验（见 Verification）；真机项待 fixture
+- [x] P4a 任务状态/恢复/投递：`src/tasks/state.ts`（状态与可达性分离、`cancelling` 语义、稳定 `eventId`）、`src/tasks/recovery.ts`（只发终态一次、`unknown` 不发、缺归属不猜并记 `notAwakened`）、`src/tasks/delivery.ts`（去重、单观察者租约、忙碌/无会话排队不丢、payload 仅元数据）。**10 项语义用假依赖离线验满**（见 Verification）
+- [x] P4b-1 持久化与迁移：`src/tasks/store.ts` 新增（`<OCTSSH_HOME>/tasks/` 下落盘 delivered/queue/leases/index，`withLock` + 原子写、重启后已投递集与队列都保留、损坏文件改名保留并置 `storeCorrupt`、索引 v0→v1 迁移、更高版本不降级）；修复 `src/tasks/delivery.ts` 的注入点缺口（异机不可抢的规则上移到库内）。离线性质已验（见 Verification）
+- [x] P4b-2a 扫描与裁剪：`src/tasks/notify.ts` 新增（`runTaskSweep` 注入式编排：观察失败不改状态不产事件、单任务失败不中断整轮、显式上报 `storeCorrupt`）；`src/tasks/store.ts` 加已投递记录 v1→v2 迁移与 `pruneDelivered`（旧条目无时间 → 保留且**不被时间裁剪**）。离线性质已验（见 Verification）
+- [x] P4b-2b 接入与面板：`src/core/runtime.ts` 接 `createTaskStore`/`createDelivery`/`runTaskSweep`/`flushTaskNotifications`/`pruneTaskDelivered`（观察失败一律 `unknown`）；`extensions/octssh.ts` 接通知通道与 `/octssh tasks [wake on|off]` 面板（按需打开、默认当前项目、详情/日志/取消仍走 runtime 裁决）、2 分钟级扫描定时器（`unref` + `session_shutdown` 清理）、`storeCorrupt` 只提示一次（runtime 侧记账）；`src/state/config.ts` 新增 `taskNotify{autoWake,sweepIntervalSeconds,deliveredRetentionDays,deliveredMaxEntries}`。接入类结论为**代码路径核实**（见 Verification）
+- [x] P4b-3 收尾小项（已验，见 Verification）：裁剪挂进 `sweepTasks`（读 `taskNotify.deliveredRetentionDays/MaxEntries`，**裁剪失败被吞掉、不影响整轮扫描**）；`applyEdit` 新增 `not_found`（目录/符号链接原因不变）；`readFile` 空窗口改为 `shownFrom/showTo: null` + warning
+- [x] P5 文档与真机清单：`.ralph/real-machine-checklist.md`（6 组 47 项）+ `README.md`（新增两工具、四选项与项目权限约束、子命令表、状态目录与 `taskNotify` 配置、新增「限制与保证边界」10 条）+ `skills/octssh/SKILL.md`（新工具、读改写工作流与约束、安全确认扩写、使用边界新增 6 条）；`README.zh.md` 仅指向 README.md，无需改
+- [x] P5b 分层 AGENTS.md：根 `AGENTS.md`（50 行：目录地图、命令、规范、14 条红线）+ `src/remote/AGENTS.md`（28 行）+ `src/tasks/AGENTS.md`（29 行）；**已按 spec 实测子目录注入**（见 Verification）
+- [x] P6b 审查剩余项的**文档化**（代码级小项未做，见下一条）：`README.md` 与 `skills/octssh/SKILL.md` 补充「命令规则是**本次调用的完整原串**精确匹配，换个写法（尾随 `/`、引号、空格）不命中」，并补「规则按**操作族**生效」；README「限制与保证边界」新增 `outcome_unknown` 可能残留同目录临时文件、`no_change` 不做远端确认
+- [x] P6d 三个体验/诚实性小修（已验，见 Verification 迭代 18）：`outcome_unknown` 尽力清理临时文件（`bestEffortRemove` 吞异常，`tempRemoved` 恒 false 不声称成功）；`no_change` 带 `remoteNotChecked: true` 且文案明确「未连接远端核对」；四选项弹窗在命令规则场景追加「完整原文精确匹配、改写写法不命中」提示
+- [ ] P6c 真 Pi/SSH 隔离路径验收：**阻塞于 fixture 授权**，清单见 `.ralph/real-machine-checklist.md`（47 项）；另有审查新增的真机项（见 Notes）
+
+## Reflection（迭代 16）
+
+- 进度：P0–P5 全部完成（六项功能的代码与文档都在），只剩 **P5b 根 AGENTS.md** 与 **P6 对抗审查 + 真路径验收**。已用 15 轮，余 5 轮，够用但不能再铺开。
+- 有效做法（保留）：窄 spec + 交接文件；依赖注入 seam（`applyEdit`/`readRemoteFile`/`createDelivery`/`runTaskSweep`）让语义离线验满；验收一律主线程自写探针，不复述 subagent 自述。
+- 真正阻塞（第 6 轮携带）：**真 OpenSSH fixture 未授权**。P1b/P3/P4 的真机项全部挂在这里；它不挡编码与文档，只挡那 47 项验收。
+- 风险判断（本轮重点）：**现在最大的风险不是没写完，而是「离线验过 ≠ 真机可用」被误读成已验证**。对策：P6 用对抗审查（换 agent）专门找反例与未验假设，并把结果分成「已被代码/探针证伪」「只能在真机判定」两类，写进最终报告。
+- 节奏（终版）：迭代 17 完成 AGENTS 与审查文档化；迭代 18 完成 P6d 体验收尾；迭代 19 复跑最终验证命令并确认回归面干净；迭代 20 交付最终报告（`.ralph/octssh-v1.final-report.md`）。**P6c（48 项真机验收）全程未获 fixture 授权，按 blocked 如实交付**，不标 COMPLETE。
+## Verification
+- 2026-10-17 迭代 1（P0 基线）：
+  - `npm ci` 退出码 0；`diff package-lock.json` 与安装前一致（LOCK_UNCHANGED）
+  - `npm run typecheck` 退出码 0
+  - `npm test` 退出码 1：`tests 22 / pass 21 / fail 1`，唯一失败为 `walkLocal rejects symlinks instead of following directory loops`，`EPERM: operation not permitted, symlink ...`（Windows 需管理员或 Developer Mode）
+  - 修复前后：`test/sshconfig.test.js` 由 fail 1 → pass 1；全量由 fail 3 → fail 1
+- 基线前情：依赖未安装时 `tsc` 不存在、测试 `ERR_MODULE_NOT_FOUND`，故此前无可信基线
+- 未做：任何远端连接、生产写入；能力核实属下一步
+- 2026-10-17 迭代 1（P0 取证，scout 会话 `octssh-contract-scout`，只读）：
+  - ssh2 客户端固定协商 SFTP v3（`node_modules/ssh2/lib/protocol/SFTP.js` 107/112 行），v3 attrs 只有 mode/uid/gid/size/atime/mtime，**无 inode、无 nlink** → 硬链接与 owner 名字无法由 SFTP 自证，先前“拒绝硬链接”的写法必须改由固定 `stat` 模板承担
+  - `ext_openssh_rename`（posix-rename，SFTP.js:1314）在不支持时**抛错**，可直接作能力探测；`open` 支持 `wx`（EXCL，SFTP.js:2536）；`lstat` 存在（SFTP.js:1009）但 `src/ssh/sftp.ts` 只包装了 `stat`，需新增 `sftpLstat`
+  - 现有 `sftpPut` 直接 `createWriteStream(remotePath)`（`src/ssh/sftp.ts:110-124`），无 EXCL/无 temp，**不可复用**为 edit 的写入路径
+  - `chown` 到非自身 uid 通常 EPERM → 普通用户编辑 root/他人文件会落到“owner 无法保留”分支，契约已明确该情形拒绝而不是只保 mode
+  - **ssh2 内置 Server 不支持 SFTP 文件操作、也不广播扩展**（coder 会话）→ 本地隔离 fixture 不能靠 ssh2 Server，需真 OpenSSH（本机 OpenSSH 或 WSL 内 sshd），否则 SFTP 契约无法真路径验证
+  - 宿主/归属零基础：`extensions/octssh.ts` 工厂拿不到 cwd（:186），`createOctsshRuntime()` 无参（`src/core/runtime.ts:355`）；异步传输活跃表是模块级 Map（`src/transfer/manager.ts:14`），第二个 Pi 进程既看不见也取消不了
+  - 状态写入非跨进程安全：`saveSession` 整文件读改写（`src/state/sessions.ts:98-108`），`atomicWriteFileSync` 是 unlink→rename（`src/state/fs.ts:20-28`），存在文件缺失窗口
+  - 测试影响面：`test/state.test.js:18`、`test/cleanup.test.js:8`（手写 record，加必填字段即挂）、`test/proxyjump-parse.test.js:5`（`deepEqual {host,user,port}`，跳板身份不要塞进该返回值）为必然触及；`test/transfer.test.js`（`sftpStat` 错误码映射、`sftpGet` 原子性）、`test/shell.test.js:5`（`wrapSh` 前缀断言）为风险面；`pool/resolve/sshconfig/smoke` 加字段安全
+- 未验证：以上均为只读取证与依赖/源码事实，不含真路径验收
+  - coder 会话 `octssh-implementation` 本轮触顶 1800s 超时，已完成部分仅留一句结论（ssh2 内置 Server 不支持 SFTP 文件操作/不广播扩展）；会话仍在，下轮先索取结论摘要再续推，不重开
+- 2026-10-17 迭代 2（P0 能力静态取证，主线程自查依赖源码与 `.d.ts`）：
+  - `pi-tui` 的 `Input`（0.81.1 与 1.3.0）**都没有 mask/password 选项**，`ctx.ui.input()` 是明文 → 遮罩必须自造 `ctx.ui.custom<T>(factory,{overlay})` 组件；两版 `Component`/`Focusable` 结构一致（1.3.0 仅多可选 `handleMouse`），故 devDeps 不必升到 1.3.0
+  - ssh2 `hostVerifier(key, verify)`：`verify` 是回调 → **可异步**（首次确认/变化阻止够用）；设 `hostHash` 时 `key` 是 hex 摘要，**不设**才是原始主机公钥字节 → 指纹自己算 `SHA256:base64` 才能与 `ssh-keygen -lf` 对齐（`node_modules/ssh2/lib/client.js:273-286`）
+  - ssh2 `passphrase` 配置项存在（`@types/ssh2:735-742`）；`authHandler(authsLeft, partialSuccess, cb)` 允许异步 cb 且能看到服务器剩余方法 → 可据此区分「仅 keyboard-interactive」（`client.js:836-853,1077`）；`tryKeyboard` 默认 false，保持关闭
+  - SDK：`ctx.mode: "tui"|"rpc"|"json"|"print"`、`ctx.hasUI`、`ctx.isIdle()`、`sendMessage(msg,{triggerTurn,deliverAs})` 两版都有；`triggerTurn` 仅对 **idle** 的自定义消息开启新回合（`types.d.ts:735`），忙时用 `deliverAs` 排队 → 与通知契约一致
+  - 未实连，故仍属「静态已证」；`hostVerifier` 指纹格式、passphrase 流程、`posix-rename`/`stat` 模板可用性必须在真 OpenSSH 上对拍
+- 未验证：上述 API 结论来自依赖源码与 `.d.ts` 阅读，不是运行时行为验证
+- 2026-10-17 迭代 3（P1a 实现 + 主线程独立验证）：
+  - `npm run typecheck` 退出码 0；`npm test`：`tests 22 / pass 21 / fail 1`，唯一失败仍是 symlink `EPERM`（环境限制，与实现无关）→ **无回归、未新增/修改测试**
+  - 指纹对拍（本机 `ssh-keygen` 生成 ed25519 + RSA，拿公钥 blob 走 `computeHostKeyFingerprint`，与 `ssh-keygen -lf` 逐字符比对，**一致**）：
+    - ed25519 → `SHA256:lf4baDB4VJu9guzahNCCK1QdMb2K+/T1xMSHE+yXtuE`（算法解析 `ssh-ed25519`）
+    - RSA → `SHA256:g3V4/hikZyW/7XW9lq4afloSxT4qgNdKelTpOzeE0/8`（算法解析 `ssh-rsa`）
+  - `identityKey` 独特性：user/host/port/alias/跳板 各自变化 → 6 个输入得到 **6 个互不相同**的 key（`distinct 6/6`）；`displayIdentity` 输出 `octssh@127.0.0.1:2222 (minipc) via u@j:22`
+  - `createHostVerifier` 行为 6 例（临时 baseDir，离线可重跑，探针脚本 `C:/tmp/octssh-fp/verifier-probe.cjs`，**未入库**）：unknown+无 UI → `NO_UI`/拒绝；unknown+同意 → 通过且落盘 `known-hosts.json`（1 条记录）；已信任 → 通过且 `confirmCalls=0`；密钥变化 → `HOST_KEY_MISMATCH`、`confirmCalls=0`、无「仍然继续」；用户拒绝 → `HOST_KEY_REJECTED` 且**未落盘**；信任表损坏 → `TRUST_STORE_UNREADABLE` 且 `confirmCalls=0`（fail closed）
+  - 主线程修复：跳板机此前**没有** hostVerifier（`src/core/runtime.ts` 只给 target 传），已补 `jumpVerifier`，跳板身份为 `alias~jump`。这是契约「目标与跳板都校验」的直接缺口，不修则跳板段可被中间人绕过
+  - 确认 UI 只在 `ctx.hasUI && ctx.mode === "tui"` 提供（`extensions/octssh.ts` 的 `hostKeyConfirm()`）；`/octssh trust [forget <host:port>]` 已注册
+  - **未验**：真机握手（指纹展示、ppk/passphrase）、`AUTH_FAILED/NETWORK` 分类的真实分支 —— 需真 OpenSSH fixture
+- 2026-10-17 迭代 4（P1b 实现 + 主线程补跑离线验收）：
+  - `npm run typecheck` 退出码 0；`npm test`：`tests 22 / pass 21 / fail 1`（仍为 symlink `EPERM`）→ 无回归、未新增/修改测试
+  - 凭据语义探针（`C:/tmp/octssh-fp/cred-probe.cjs`，未入库）原文：同 key 并发 `promptCalls=1 same=true`；`invalidate` 前后 `1 → 2`；`clearAll` 返回 4 且之后重弹；取消返回 `undefined` 且下次仍弹（`promptCalls=2`）；prompt 抛错时错误为 `CredentialPromptError: Error while requesting password for e@h:22`，`secretLeaked=false`
+  - 全局串行探针（`C:/tmp/octssh-fp/serial-probe.cjs`，未入库）：`maxActive=1`，事件序列 `a:start(a=1) | a:end(a=0) | b:start(a=1) | b:end(a=0) | c:start(a=1) | c:end(a=0)`（真测量，非断言）
+  - 加密私钥判定方式：用 ssh2 `parseKey` 返回 Error 且 message 含 `passphrase` 判定，**不**依赖匹配连接期错误，可在发起网络连接前完成
+  - 已知缺口（留给 P5）：`SecretPrompt` 忽略多字符输入 → **粘贴密码无效**；需支持 bracketed paste
+  - **未验（真机）**：真实密码登录、错误口令后停止、keyboard-interactive-only → `AUTH_UNSUPPORTED`、凭据不落 session json/日志
+- 2026-10-17 迭代 5（P2a 实现 + 主线程独立验证，探针 `C:/tmp/octssh-fp/p2a-probe.cjs`、`p2a-probe2.cjs`、`lock-release.cjs`，均未入库）：
+  - `npm run typecheck` 退出码 0；`npm test`：`tests 22 / pass 21 / fail 1`（仍为 symlink `EPERM`）→ 无回归、未改测试
+  - 裁决：`no-rules -> ask(no_rule)`；命中 allow → `allow`；allow+deny 两种顺序都 → `deny`（与规则顺序无关）；`/app` 子树不匹配 `/application` 但匹配 `/app/x`；精确文件 `/srv/a.conf` 不匹配 `/srv/a.conf2`；user 与「新增跳板」任一不同 → 不命中；非法规则对象 → `deny(invalid_rule)`；`builtinBlock` → `deny(builtin:...)`
+  - 命令规则：`git status` + cwd `/srv/app` 精确命中 → allow；`git status; rm -rf /` → 不命中；cwd 不符 → 不命中；`sudo=true` 与规则 `sudo:false` 不符 → 不命中；**cwd 未知 → 不命中**（fail closed）
+  - 规则存储：空项目 0 条；add×2 → 2 条；remove → 剩 1；损坏文件抛 `RulesUnreadableError`（不是「无规则」）；`evaluateForProject` 对损坏文件 → `deny(rules_unreadable)`；不同 projectId 互不可见
+  - 项目身份：仓库根与子目录得到同一 projectId；不同目录不同；非 git 目录按**启动目录**取 id（子目录启动会得到另一个 id —— 契约如此，但这条有锋利边缘，见 Notes）
+  - 锁：同进程先持有再申请 → 串行 `t1-in,t1-out,t2-in,t2-out`；**崩溃遗留锁（`instanceId = hostname#deadpid`）可接管**；异机锁 → `LockBusyError`（不接管）；损坏锁 → `LockBusyError`（fail closed）；成功/抛出后均释放（`released=true`，且 fn 抛错会向上传播）
+  - 我自己的探针曾有**两处错**，已纠正后复测，记录以免误读证据：①exec 规则未传 `cwd` 导致「精确命中」误判为 `ask`——实际是请求缺 cwd，规则不匹配属预期；②伪造的 `instanceId` 缺 `hostname#` 前缀，导致「死锁接管」误判为失败——用真实格式复测即接管成功。**不是实现缺陷。**
+- 2026-10-17 迭代 6（P2b 接入 + 主线程独立验证，探针 `C:/tmp/octssh-fp/p2b-probe.cjs`，未入库）：
+  - `npm run typecheck` 退出码 0；`npm test`：`tests 22 / pass 21 / fail 1`（仍为 symlink `EPERM`）→ 无回归、未改测试
+  - **回放性质（最关键，错了会让「始终允许」静默失效）**：由请求造出的规则再回放同一请求，5 条含空格/单双引号/管道/中文/日文的命令全部 `allow`；追加 `&& whoami` 后全部回落 `ask`（不做前缀授权）
+  - deny 回放：`sudo:true` 的 deny 规则命中同命令 `sudo:true` → `deny`，而 `sudo:false` → `ask`、换 user → `ask`（sudo 与身份是独立条件）
+  - 文件规则默认精确：命中 `/srv/app/config.yml` 为 `allow`，`config.yml.bak` 与同目录 `other.txt` 均为 `ask`
+  - `guard.action === "block"` → `deny(builtin:iptables)`，且**并存的 allow 规则不能覆盖**；`guard.action === "needs_confirmation"` + 无规则 → `ask`
+  - **代码路径核实（非执行）**：deny 判定位于 `pool.get()` 之前（`src/core/runtime.ts` exec 路径第 234-237 行），因此被禁止的操作不会先握手；`exec`/`exec-async`/`upload`/`upload-async`/`download`/`download-async` 与 4 个 session 入口均可检索到裁决调用
+  - **模型不可提供项目身份**：TypeBox 工具 schema 中检索 `projectId` 无任何命中，`projectId(ctx)` 只从 `ctx.cwd` 推导（`extensions/octssh.ts`）
+  - **诚实缺口（已知、未修）**：①`session-*` 与 `download` 只判 deny，项目 `ask`/`allow` 对它们无效果（这些操作从不弹窗，因此今天也造不出它们的 ask/allow 规则；只有手改规则文件才会出现「规则被忽略」）；②`download` 不产生可持久化 scope（它本来就不弹窗，冲突是硬阻塞）；③`allowPermanent` 目前只在上传冲突路径计算，P3 的 read/edit 需要补
+  - coder 自报的 ssh2 内置 Server 端到端（allow 时服务器收到命令、deny 时未收到）**我未复跑**，仅以代码路径核实替代；SFTP 类验证仍等真 OpenSSH
+- 2026-10-17 迭代 7（P3a 实现 + 主线程独立验证，探针 `C:/tmp/octssh-fp/p3a-probe2.cjs`，未入库）：
+  - `npm run typecheck` 退出码 0；`npm test`：`tests 22 / pass 21 / fail 1`（仍为 symlink `EPERM`）→ 无回归、未改测试；`git diff --stat src/ssh/sftp.ts` = `+87` 且**无删除行**（纯追加，现有函数未动）
+  - token：`v1i|33188|1000|1000|42|1700000000|987654|1` 往返字段一致；`v1w` 解码为 `weak`；7 个字段逐个篡改**全部**被检出；弱 token 传入 edit → `weak_version` 拒绝；强 token 接受；截断 token → `null`
+  - `stat` 模板命令：`stat -c '%i|%h' -- '/srv/含空格 的/文件'\''x'`（含空格与单引号路径正确转义）；`parseStatOutput("gnu"," 987654|1\n")` → `{ok:true,inode:"987654",nlink:"1"}`；垃圾输入 → `{ok:false,reason:"unparsable_field"}`
+  - 编辑规划：CRLF 文件替换不跨行 → `"a\r\nB\r\nc\r\n"`，**无孤立 CR/LF**；BOM 文件保留 BOM 且 `bom:true`（偏移按正文坐标，已文档化）；emoji/CJK 替换正确；非法 UTF-8 → `invalid_utf8(at:1)`；含 NUL → `binary`；匹配 0 次 → `no_match`；2 次 → `ambiguous_match(2)`；空 oldText → `empty_old_text`；超 2 MiB → `too_large`；token 与实测不符 → `version_mismatch`
+  - diff 有界：1 万行文件改 1 行 → `lines=8 totalLines=8 truncated=false`，diff 正文仅 95 字节；输出与原文**长度相同、改动跨度之外首尾逐字节一致**
+  - **发现的小问题（记入 P3b）**：`oldText === newText`（空操作）时仍返回 `ok:true` 且报出 `changedSpan=1` 与 3 行 diff。文件内容无损，但会触发一次无谓的 temp+rename 写入并显示一个并不存在的变更 —— P3b 应在写入前短路为「无变更」结果
+  - 未验（真机，已在 `.ralph/handoff/P3a.md` 列 8 项）：`stat` 模板在真实主机上的选择与 inode 稳定性、`posixRename` 支持性、`wx` 错误码、`chown` EPERM 分支、SFTP mtime 秒级精度影响
+- 2026-10-17 迭代 8（P3b-1 编排 + 主线程用假适配器独立验证，探针 `C:/tmp/octssh-fp/p3b1-probe.cjs`，未入库）：
+  - `npm run typecheck` 退出码 0；`npm test`：`tests 22 / pass 21 / fail 1`（仍为 symlink `EPERM`）→ 无回归、未改测试
+  - **调用顺序（原文）**：`lstat,stat,read,createTemp,write:<temp>,chown,chmod,setTimes,lstat,stat,rename,read,lstat,stat` —— 建临时文件在 rename 之前、**第二次指纹核验在 rename 之前**、rename 之后只剩读操作（`opsAfterRename=["read","lstat","stat"]`，无任何变更操作）
+  - 成功路径：内容 `"a\nB\n"` 正确、mtime 已更新（≠ 原值）、chmod/chown/setTimes 均被调用、返回新 token 前缀 `v1i`
+  - 结果映射（注入单点失败）：`write` 失败 → `not_written`（tempRemoved=true、未 rename、目标原文未动）；`chown` EPERM → `unsupported(chown_not_restorable)`（未 rename、临时文件已清）；`posixRename` 不支持 → `unsupported(posix_rename_unsupported)`（临时文件已清、目标未动）；**rename 本身抛错 → `outcome_unknown`**（不盲重试）
+  - 前置拒绝：nlink=2 → `unsupported(hard_linked)`；符号链接 → `unsupported(symlink)`；目录 → `unsupported(not_a_regular_file)`；**三者均未创建临时文件**；版本不符 → `conflict`（未建临时文件）
+  - 回读与补丁：回读字节与写入不一致 → `conflict(read-back bytes differ from the bytes we wrote)`
+  - 迭代 7 的空操作问题已修：`oldText === newText` → `no_change`，**未建临时文件、未 rename**；`dryRun` → `dry_run`（带计划字节数），同样未建临时文件
+  - 小问题（记入 P5 打磨）：文件不存在时归为 `unsupported(not_a_regular_file)` 且 `detail` 为空字符串 —— 用户看不出「文件不存在」。建议加 `not_found` 原因或至少填 detail
+  - 澄清（避免误读 `git status`）：`.gitignore`、`package.json` 等文件在工作区显示为已修改，`git diff` 只有 `old mode 100755 → new mode 100644`，**内容零变化**，属环境检出/`npm ci` 产物，不是本轮改动
+  - 未验（真机）：`sftpFileOps.ts` 适配器本身（SFTP 原语、`wx` 错误码、`posixRename` 真实可用性、`chown` 真实 EPERM）—— 需真 OpenSSH fixture
+- 2026-10-17 迭代 9（P3b-2 工具/runtime + 主线程用假适配器独立验证，探针 `C:/tmp/octssh-fp/p3b2-probe.cjs`、`p3b2b-probe.cjs`，未入库）：
+  - `npm run typecheck` 退出码 0；`npm test`：`tests 22 / pass 21 / fail 1`（仍为 symlink `EPERM`）→ 无回归、未改测试
+  - 读取：整份读取返回**强 token**且与手工按同一字段集算出的 token **逐字符一致**；`offset=2&limit=2` 只显示两行而 token **仍覆盖整份文件**（`tokenCoversWhole=true`）；BOM 标记正确且 BOM 不计入正文、CRLF 原样保留（`crlfIntact=true`）；非法 UTF-8 → `rejected/invalid_utf8`；含 NUL → `rejected/binary(NUL at byte 1)`；超限 → `rejected/too_large`；符号链接 → `rejected/symlink`；目录 → `not_a_regular_file`；**文件不存在 → `not_a_regular_file` 但 detail 明确为 `file not found`**（读取路径比 edit 路径清楚，P5 的 detail 问题只属 `applyEdit`）
+  - `statProbe` 报模板不可用 → 返回**弱 token `v1w` + 明确警告**（「不支持可用 `stat` 模板…不能用于 edit：编辑前请重新读取」），不报错
+  - 版本校验真实验证：文件真变化（长度 + mtime 不同）→ `version_mismatch`
+  - **指纹的已知盲区（有复现）**：若外部改写**保持长度与 mtime 不变**（例如同样长度改写后 `touch -r` 还原时间），指纹无法察觉，编辑会在 `oldText` 仍存在时照常执行（`V2`/`V3` 两例）。这是 size+mtime+inode+nlink 的固有边界，正好印证契约里「不声称对外部写者的 CAS」—— 需在文档与错误信息中如实写明，不能让人误以为 token 等于内容哈希
+  - 工具 schema：`readSchema = {machine, path, offset?, limit?}`、`editSchema = {machine, path, expectedVersion, oldText, newText, dryRun?}` —— **无 `projectId`**，`expectedVersion` 必填
+  - `outcome_unknown` 的工具文案原文：「写入结果未知（rename 期间失败，可能已写入也可能没有）。**不要重试**：请先用 octssh_read 重新读取并核对内容。」→ 与契约一致
+  - 代码路径核实：`readFile` 的 deny 判定在 `pool.get()` 之前；`editFile` 的 deny 在建连前、`pre.decision === "ask"` 时才 `requestAuthorization`（精确文件 scope + `allowPermanent=true`）、命中 `allow` 则跳过确认但 `applyEdit` 的版本与属性校验照旧
+  - 小问题（记入 P5）：`offset` 超过末尾时返回空文本但报告 `shownFrom=3, shownTo=3`，看起来像「显示了第 3 行」；`limit=0` 报 `shown=0-0`。建议空窗口时给出明确提示（如 `shownFrom=null` 或附 warning）
+  - 未验（真机）：`createSftpFileOps`/`readAllVia`/`probeStat` 三条真适配路径、read 的 ask 分支端到端、`stat` 模板在真机上的选择 —— 需真 OpenSSH fixture（coder 已在交接文件承认同三项未完成）
+- 2026-10-17 迭代 10（P4a 实现 + 主线程用假依赖独立验证，探针 `C:/tmp/octssh-fp/p4a-probe.cjs`、`p4a-probe2.cjs`、`p4a-probe3.cjs`，未入库）：
+  - `npm run typecheck` 退出码 0；`npm test`：`tests 22 / pass 21 / fail 1`（仍为 symlink `EPERM`）→ 无回归、未改测试
+  - 状态机：取消请求 → `cancelling`；此后自然完成 → 取实际结果 `done`；确认停止 → `cancelled`；screen 任务的 owner 消失 → 仍是 `running`（reason `local owner gone; remote task keeps running`）；进程内传输在重启后 → `interrupted`（reason `in-process transfer cannot survive a restart`）
+  - 可达性：`unknown` 观测 → 状态不变、**事件 0 条**、`shouldPersist=false`（完全不动记录）
+  - 事件：`eventId("t1","done")` 两次调用完全一致；首次扫描发 1 条并写入 `emittedEventId`；用同一终态重复扫描 → 发 0 条
+  - 投递去重：同一事件投两次 → `delivered` / `duplicate`，**transport 只被调用 1 次**；payload 字段仅 `taskId,machine,state,exitCode,startedAt,endedAt,durationMs`，**不含** stdout/stderr/完整命令
+  - 排队语义：`channelState=busy` → `queued(reason=busy)`、未发送、`deliveredCount=0`、队列 1 条；`no_session` 同理；改为 `ready` 后 `flush` → `delivered=1 remaining=0` 且真发出 1 次；队列内同一 `eventId` 只保留一份
+  - 租约：A 拿到后 B 拿不到（holder=A）；**同机死 pid 可接管**（默认判活策略下 `delivered`）；**异机持有者不抢**（`lease_held`，holder=Y）；持有者存活时不抢（`lease_held`）；投递完成后再来 → `duplicate`
+  - 缺归属：旧记录无 `projectId` → 事件 0 条且 `notAwakened=[{taskId,state,reason:"missing_project_id"}]`
+  - **我的探针本轮又错两处（不是实现缺陷，记录以免误读）**：①第一版把 `deliver(event, transportFn, options)` 当成签名，实际是 `deliver(event)` + 依赖全部在 `createDelivery({store,self,send,channelState})`，导致 `delivered` 与 `transportCalls=0` 同时出现、以及「busy 却直接投递」等假象；②我注入了一个**自己写的** `isHolderAlive`，它没有实现「异机一律视为存活」的规则，于是异机持有者被误判为死，出现假的「异机可抢」；换回默认策略后为 `lease_held`。**此点已升级为下面 Notes 里的 API 隐患。**
+  - 未验（真机/真 Pi）：投递通道接上 `ctx.isIdle`/`sendMessage` 的真实行为、Pi 重启补报、面板交互 —— P4b 范围
+- 2026-10-17 迭代 11（P4b-1 持久化 + 修复注入点 + 主线程用真实临时目录独立验证，探针 `C:/tmp/octssh-fp/p4b1-probe.cjs`、`p4b1b-probe.cjs`，未入库）：
+  - `npm run typecheck` 退出码 0；`npm test`：`tests 22 / pass 21 / fail 1`（仍为 symlink `EPERM`）→ 无回归、未改测试
+  - **安全修复的验收口径（本轮重点）**：注入上一轮那个「对异机返回 false」的朴素判活实现后，**异机租约仍为 `lease_held`**（holder=Y，未被抢）；同机且 pid 已消亡的持有者仍能接管（`delivered`）—— 规则上移生效，且没有把合法接管一起堵死
+  - 重启语义：`markDelivered` 后新建 store 实例（模拟重启）→ 同一事件再投为 `duplicate` 且**未发送**；busy 时入队 → `queue.json` 落盘 1 条 → 重启后 `flush` 投出 1 条、剩余 0、真发送 1 次（队列不丢）
+  - 损坏处理：损坏 `delivered.json` / `index.json` → 置 `storeCorrupt=true`、原文件**改名保留**（`*.corrupt-*`）、继续可用；不静默当空
+  - 迁移：无 `version` 的旧 `index.json` → 读到 1 条记录（`taskId=old1`）并**回写为 `version: 1`**；`version: 99` → 不降级、文件改名保留、置标记；任务记录往返（含 `emittedEventId`）一致
+  - 并发写：三个 `markDelivered` 并发后，三个 id 都查得到（无互相覆盖）
+  - **API 注意（P4b-2 必须照做）**：索引不可读或版本过高时 `loadTasks()` **不抛错**，而是返回空 + 置 `storeCorrupt` —— 调用方若只看返回值就会表现得像「没有任何任务」（可能重复唤醒或丢掉待投递）。P4b-2 接入时必须显式检查 `status().storeCorrupt` 并告知用户
+  - 我自己的探针又错一处（记录以免误读）：第一版把索引写在 `<baseDir>/index.json`，实际路径是 `<baseDir>/tasks/index.json`，导致「迁移未生效」「高版本被接受」两个假象；改用正确路径后分别得到「已迁移 `version:1`」与「不降级 + 置标记」
+  - 已知缺口（coder 主动承认）：`delivered.json` 无保留期裁剪（会无界增长）；`storeCorrupt` 的用户提示未接；`createTaskStore` 尚未接入 runtime/extension —— 均属 P4b-2
+- 2026-10-17 迭代 12（P4b-2a 扫描/裁剪 + 主线程用真实临时目录独立验证，探针 `C:/tmp/octssh-fp/p4b2a-probe.cjs`、`p4b2a-probe2.cjs`，未入库）：
+  - `npm run typecheck` 退出码 0；`npm test`：`tests 22 / pass 21 / fail 1`（仍为 symlink `EPERM`）→ 无回归、未改测试；`src/util/lockfile.ts` **未被修改**（死锁是靠重构 store 只取一次锁解决的，没有把锁改成可重入）
+  - 正常一轮：`scanned=1 events=1 delivered=1 sends=1 recordsUpdated=1` 且记录写回 `emittedEventId`；第二轮 `events=0`、`sends` 仍为 1（不重复唤醒）
+  - 观察失败不污染状态：`observe` 抛错的任务仍为 `running`、且**其余任务照常投递**（`failures=1 events=1 sends=1`）；`unknown` → `events=0 sends=0 state=running`
+  - 多任务：两个同时完成 → `scanned=2 events=2 sends=2`（互不影响）
+  - 索引损坏 → `storeCorrupt=true corruptFiles=1`（显式上报，未静默当无任务）
+  - **无会话的等待路径（真实验证）**：无会话那轮 `events=0 notAwakened=1` 且**未写 `emittedEventId`**；下一轮有会话 → `events=1 sends=1`；再一轮 → `events=0 sends=1`。即「等待」靠下一轮重新推导事件，而不是入队 —— 不会丢、也不会重发，这是「重启补报」的真实机制
+  - 裁剪：6 条已投递 + `maxEntries=2` → 删 4 留 2（留下的正是最近两条），**队列不受影响**；v1 旧格式（只有 `ids`、无时间）→ 迁移为 v2、旧 id **仍能拦住重复投递**、且**不被时间裁剪删除**（`maxAgeMs=1` 时被删的是有时间戳的新条目）
+  - 我的预期错一处（记录以免误读）：S4 我原以为「无会话」会把事件放进投递队列再 flush，实际设计是**不产事件、留待下轮重新推导**；两者都能防丢，后者还少一份重复状态，已按实际行为复验通过
+  - 未接入（P4b-2b）：`runTaskSweep`/`pruneDelivered` 尚未接 runtime/extension、`storeCorrupt` 的用户提示未接、queued 补发需宿主周期调 `delivery.flush()`
+- 2026-10-17 迭代 13（P4b-2b 接入 + 主线程**代码路径**核实；本轮未连远端，故未做行为探针）：
+  - `npm run typecheck` 退出码 0；`npm test`：`tests 22 / pass 21 / fail 1`（仍为 symlink `EPERM`）→ 无回归、未改测试
+  - **通知契约（代码路径核实，非执行）**：全仓库 `sendMessage` 只有一处调用（`extensions/octssh.ts:178`），携带 `{ triggerTurn: true }`；其外层 `sink` 有 `if (!notifyConfig.autoWake || !ctx.isIdle()) return;` **第二次**把关；通道函数在 `autoWake` 关闭或非 TUI 时返回 `no_session`（事件入队而非丢弃）。因此「忙时不打断、关唤醒不开新回合」有两道独立护栏
+  - 定时器：`setInterval` 后立刻 `unref()`，`session_shutdown` 里调 `stopSweepTimer()`（`clearInterval` + 置 null），符合「关闭后不留后台刷新」
+  - `storeCorrupt` 只提示一次：runtime 侧 `summary.storeCorrupt && !this.taskStoreCorruptReported` 决定 `storeCorruptReported`，再置位；扩展据此只通知一次（`extensions/octssh.ts:220-223`）；面板另行按需展示
+  - 面板取消走裁决：`/octssh tasks` 的「取消任务」调 `rt.cancelSession(task.taskId, undefined, pid)`，即经 runtime 的 `sessionDenied` 判定，未直调 screen 杀进程
+  - 工具 schema 再次核实：`awk` 抽取全部 `Type.Object` schema 后 `projectId` 命中 **0**（模型仍无法提供项目身份）
+  - **已知缺口（新发现，记入 P4b-3）**：`pruneDelivered` 在 store 与 runtime 都暴露了，但**没有任何调用点**，因此 `deliveredRetentionDays`/`deliveredMaxEntries` 目前是「看起来在生效、实际不裁剪」的配置 —— 这比没有配置更容易误导，要么把裁剪挂进扫描周期，要么先撤掉这两个配置项
+  - 未验（需真 Pi，已列入 P5 真机清单）：`ctx.isIdle()` 的真实空闲判定与 `sendMessage({triggerTurn:true})` 真实开回合、扫描周期节奏、面板交互、`cancelSession` 往返
+- 2026-10-17 迭代 14（P4b-3 三处收尾 + 真机清单落盘；主线程独立验证，探针 `C:/tmp/octssh-fp/p4b3-probe.cjs`，未入库）：
+  - `npm run typecheck` 退出码 0；`npm test`：`tests 22 / pass 21 / fail 1`（仍为 symlink `EPERM`）→ 无回归、未改测试
+  - 裁剪已真的接上：`sweepTasks` 每轮调 `pruneTaskDelivered()`（`src/core/runtime.ts:849`），后者从 `this.cfg.taskNotify` 读 `deliveredRetentionDays`/`deliveredMaxEntries`（`:885-889`），且**内部 try/catch 吞掉失败**返回 0/0（`:890-895`）—— 裁剪读不到/写不进不会让整轮扫描失败，符合要求
+  - `not_found`：`lstat` 返回 null → `unsupported/not_found`；目录 → `not_a_regular_file`；符号链接 → `symlink`（三者区分清楚，未误伤原有语义）
+  - 空窗口：`offset=99` 与 `limit=0` → `shownFrom=null shownTo=null text="" warnings=1`；正常窗口 `offset=2&limit=1` → `shownFrom=2 shownTo=2 text="b\n" warnings=0`（`token 覆盖整份文件` 的语义未被动到）
+  - 手工裁剪路径仍可用：5 条已投递 + `maxEntries=1` → `removed=4 kept=1`
+  - **我的探针错一层（记录以免误读）**：我拿 `runTaskSweep`（notify.ts）的返回值找裁剪字段，得到 `missing`；实际裁剪挂在 **runtime 的 `sweepTasks`**（返回 `deliveredPruned`）—— 编排层不知道 `taskNotify` 配置，这也解释了为何它在那里。已按 runtime 层重新核实
+  - 产出：`.ralph/real-machine-checklist.md`（6 组 47 项：指纹/凭据/SFTP 与 `stat`/权限/任务通知/跨进程，每项含动作、期望、结果空栏与执行约定；fixture 准备命令标注**需授权**）
+- 2026-10-17 迭代 15（P5 文档，主线程直接改；本轮无代码改动，故仅 `typecheck`/测试复跑作回归确认）：
+  - `npm run typecheck` 退出码 0；`npm test`：`tests 22 / pass 21 / fail 1`（仍为 symlink `EPERM`）→ 无回归
+  - `README.md`：工具表加 `octssh_read`/`octssh_edit`；新增读改写示例（含 `expectedVersion` 注释）；「安全确认」重写为四选项 + 项目权限约束 + 不建立连接 + 不覆盖内建禁止 + 非沙箱声明；`/octssh` 新增子命令表（trust/permissions/credentials/tasks）；「配置」新增状态目录布局与 `taskNotify` 四项；**新增「限制与保证边界」10 条**（token 非内容哈希、TOCTOU、无法安全保留即拒绝、凭据边界、screen vs transfer、unknown≠failed、非 exactly-once、取消语义、跳过确认≠跳过校验）
+  - `skills/octssh/SKILL.md`：工具表补齐；新增「读取与修改远端文件」小节（工作流 + 6 条约束，含 `conflict` 重读、`outcome_unknown` **不重试**）；「安全确认」扩写（四选项、规则匹配维度、指纹确认、遮罩输入）；「使用边界」新增 6 条（`unknown` 不等于失败、取消语义、传输不续传、`/octssh tasks wake off` 等）
+  - `README.zh.md` 只有 5 行且指向中文 README.md，无需修改
+  - 本轮为**文档**改动：不含行为变更，因此没有「真路径」可验；文档中关于行为的表述均标自前述迭代的离线/静态结论，**真机未验项保持未验**（见清单）
+- 2026-10-17 迭代 16（P6 对抗审查 + 修 3 项真问题；主线程独立验证，探针 `C:/tmp/octssh-fp/p6fix-probe*.cjs`，未入库）：
+  - `npm run typecheck` 退出码 0；`npm test`：`tests 22 / pass 21 / fail 1`（仍为 symlink `EPERM`）→ 无回归、未改测试
+  - **审查由另一个 agent/模型（audit 会话 `octssh-adversary`，非实现者）执行**，逐条找反例，不采信前述自述。首轮只回了一句开场白（空交付），主线程把范围收窄到 3 项后得到具体结论 —— 记录该失败：宽泛的「全面对抗审查」prompt 对该 agent 无效，必须给死条目与固定输出格式
+  - **已修问题 1（语义错误，最严重）**：`applyEdit` 的 `posixRename` 成功之后，回读抛错或回读字节不一致原先落到 `not_written`/`conflict`，而上层把 `not_written` 渲染成「目标文件未被改动」——**文件其实已被替换**。探针原文：
+    - `F1 read-back throws → kind=outcome_unknown calledRename=true`
+    - `F1 read-back mismatch → kind=outcome_unknown calledRename=true`
+    - `F1 normal → success`；回归 `F2 write fails → not_written`、`F3 version mismatch → conflict`、`F4 no_change`、`F5 dry_run` 均未被弄坏
+  - **已修问题 2（安全）**：`exec` 与 `exec-async` 的规则原先不互通（`rule.operation === req.operation` 严格相等）→ 一条 deny 规则换个工具名就失效。现按**操作族**比较（`src/security/evaluate.ts:54-65` 的 `operationFamily()`，`:116` 按族比较）。探针原文：
+    - `F6` 手造含 cwd 的请求：exec deny 规则 vs `exec-async` 请求 → `deny`
+    - `H4` 规则与请求都无 cwd：exec deny 规则 vs `exec-async` 请求 → `deny`
+    - `G3 upload allow 规则 vs upload-async → allow`、`G4 download deny vs download → deny`
+    - `G5 read allow 不泄漏到 edit → ask`（读写不同族，正确）、`G6/G7 无关族不受影响 → ask`
+  - **已修问题 3（契约缺口）**：`ask` 原先在 read/upload/download/session 入口是空操作（只判 deny）。现按代码路径核实已插入确认：`runtime.ts:412`（upload）、`:449`（download）、`:474`（upload-async）、`:511`（download-async）、`:547`（read），session 入口 `:542/:592`；样式统一为 `if (pre.decision === "deny") … ; if (pre.decision === "ask" && !this.consume(...)) …`。**本轮未做行为级验证**（需真主机才能走到该分支），故标为代码路径核实
+  - **审查确认「未找到反例」的项**（可当日志用）：弱 token 进不了 edit（`v1w` 在 `fingerprint.ts:170-173` 抛、无降级分支）；篡改 token 字段无效（CAS 判断按 **token 字符串**比较，且 `currentToken` 由真实 `lstat`+`stat` 现算）；`chown/chmod/setTimes` 全部作用于**临时文件**，不存在「rename 前改到目标」；`dry_run` 不落盘；一次性授权无法换参数复用（先 `grants.delete` 再比 digest，失配即烧掉），且 token 只存在于扩展层局部变量、从不进工具结果；`builtinBlock` 无法被项目 allow 覆盖（`evaluate.ts:107-109` 在匹配规则前返回 deny），反向也堵住（`policy.ts` 的 `authorized` 短路发生在 deny 列表之后）
+  - **审查新发现的其余项（未修，记入 P6b）**：命令 deny 是原始整串匹配（可被 `rm -rf /data/`、引号、尾随空格平凡改写绕过）；`no_change` 在建连读文件之前返回（`edit(不存在, oldText=x, newText=x)` 也报「无变更」）；`outcome_unknown` 不保证清理 temp；token 可由模型用 `octssh_exec` 跑 `stat` 拼出（设计上无害，不破 CAS）
+  - **我本轮探针的错（记录以免误读）**：`G1/G2/H2/H3` 一度显示「exec deny 规则对同命令不生效」，原因是我用了错误参数名 `remoteCwd`（正确是 `cwd`，见 `authorize.ts:25-32`），请求因此没有 cwd 而规则要求 cwd `/x` → 按 fail-closed 不命中。**这是探针错，不是实现缺陷**（同一错误我已在迭代 5 犯过一次）
+- 2026-10-17 迭代 17（P5b 分层 AGENTS.md + P6b 文档化；含一条**真实进程**验证）：
+  - `npm run typecheck` 退出码 0；`npm test`：`tests 22 / pass 21 / fail 1`（仍为 symlink `EPERM`）→ 无回归
+  - 新建 `AGENTS.md`（50 行）、`src/remote/AGENTS.md`（28 行）、`src/tasks/AGENTS.md`（29 行），均符合 `agents-md-spec.md` 的行数与内容约束（只写「代码里看不出的意图/边界/坑/命令」，不列函数清单、不写历史）
+  - **子目录注入实测（spec 指定的维护动作，本轮唯一真实进程验证）**：
+    - 命令：`pi -p --no-session "读取 src/remote/fingerprint.ts 的前 5 行，然后只输出一行：你收到的子目录 AGENTS.md 文件路径，用逗号分隔"`
+    - 工作目录：`D:/work/project/person/pi-octssh`；退出码 `0`
+    - 输出原文：`src/remote/AGENTS.md`
+    - 结论：pi-subdir-agents 确实在读到 `src/remote/` 下文件时注入了该目录的 AGENTS.md
+  - 文档补充（P6b）：`README.md` 安全确认区新增「命令规则按**操作族**匹配」与「命令规则匹配本次调用的完整原串，换写法不命中」两条；「限制与保证边界」新增 3 条（命令规则精确匹配、`outcome_unknown` 可能残留同目录临时文件、`no_change` 不做远端确认）；`skills/octssh/SKILL.md` 安全确认区同步「操作族」与「完整原串」两条
+  - 未做（记入 P6d，属体验改善、不影响安全边界）：`no_change` 先建连确认、`outcome_unknown` 尝试清理 temp、创建命令规则时提示「仅匹配该次调用原文」
+- 2026-10-17 迭代 18（P6d 三个体验/诚实性小修；主线程独立复验，探针 `C:/tmp/octssh-fp/p6d-verify2.cjs`，未入库）：
+  - `npm run typecheck` 退出码 0；`npm test`：`tests 22 / pass 21 / fail 1`（仍为 symlink `EPERM`）→ 无回归、未改测试
+  - **本轮委派结果为「No result provided」**（subagent 返回为空），但交接文件 `.ralph/handoff/P6d.md` 完整（纪律生效）：代码已落盘、typecheck/测试输出、①–⑤ 语义原文、⑥ 弹窗文案都在。主线程据此**只补跑独立复验，没有重派**
+  - 独立复验原文（假适配器，二次注入覆盖 rename 段与回读段）：
+    - `V1 rename-unknown -> kind=outcome_unknown tempRemoved=false removeTried=true`
+    - `V2 readback-fail  -> kind=outcome_unknown tempRemoved=false removeTried=true`（迭代 16 修的「rename 后失败≠not_written」语义未破坏）
+    - `V3 remove-throws  -> kind=outcome_unknown threw=no removeTried=true`（删 temp 自身抛错不影响结果、不向上抛）
+    - `V4 no_change -> kind=no_change remoteNotChecked=true remoteOps=0`（一次远端调用都没发，且带明确「未核对」标记）
+    - 回归 `V5 success / V6 not_written / V7 dry_run` 全部保持
+  - 设计取舍：`tempRemoved` 字段**恒为 false**（类型上固定），语义是「不声称清理成功」——因为 rename 可能已生效，temp 可能已被 rename 走，「尽力删一次 + 不声称」比返回真值更诚实。上层文案同步为「已尝试清理临时文件，但不保证成功」
+  - 命令规则弹窗文案（`extensions/octssh.ts:425-426`，仅 `scope.command` 存在时追加，文件类规则不受影响）：「注意：「始终允许 / 始终禁止」保存的是这行命令的完整原文（含空格、引号与参数顺序），改写写法（多加一个参数、换引号、尾随空格、加路径斜杠）不会命中该规则，仍需再次确认。」
+  - 我的探针错一处（记录以免误读）：第一版把「回读失败」实现成**第一次** `readFile` 就抛错——那是读取阶段，`applyEdit` 按 `not_written` 语义不允许失败外泄，探针直接崩。正确做法是失败第**二次** `readFile`（回读）。**不是实现缺陷。**
+- 2026-10-17 迭代 19（最终验证命令复跑；本轮无代码改动）：
+  - 命令：`npm run typecheck && npm test`，工作目录 `D:/work/project/person/pi-octssh`，无额外环境变量、无需网络
+  - 原文：`tsc --noEmit` 通过（退出码 0）；`tests 22 / pass 21 / fail 1`，唯一失败 `walkLocal rejects symlinks instead of following directory loops`（`EPERM: operation not permitted, symlink ...`，Windows 非管理员/未开 Developer Mode 的环境限制，与实现无关）
+  - 该失败在**改动前基线（迭代 1 修复 fast-glob 后）即存在**，且此后每一轮都保持同一条，无新增失败 → 全部改动的回归面干净
+  - 外部监视器可复跑；所需工件仅为 `node_modules/`（`npm ci` 产物）
+- 2026-10-17 迭代 20（最终交付）：
+  - 交付报告落盘：`.ralph/octssh-v1.final-report.md`（交付内容、复跑命令、17 类已验离线路径、48 项 blocked 真机清单、6 条已知限制、交接物清单）
+  - 工作区改动盘点（`git status`，排除 node_modules）：48 个文件修改（+1945/−72）+ 约 20 个新文件（`src/security/` 6 个、`src/remote/` 6 个、`src/tasks/` 6 个、`src/tui/`、`src/util/lockfile.ts`、`AGENTS.md`×3、`.agents/notes/`、`.ralph/`）；所有改动**未 commit**（任务约束「不覆盖已有修改」）
+  - 最终状态：**delivered-partial** —— 离线验收完成、真机验收 blocked；未输出 COMPLETE 标记
+
+## Final Verification
+- Exact monitor-rerunnable command: `npm run typecheck && npm test`（无额外环境变量、无需网络）
+- Working directory: D:/work/project/person/pi-octssh
+- Required preserved artifacts: `node_modules/`（`npm ci` 产物，勿删）
+- Result: 当前基线 typecheck 通过、测试 21/22；剩余 1 项为环境权限限制，需在最终结论中如实标注
+- 真路径验收前提：SFTP/edit/认证类验收需**真 OpenSSH 服务端**（本机 OpenSSH 或 WSL 内 sshd + 专用测试账户与目录）；ssh2 内置 Server 不足以承载。缺少该 fixture 时相关项标 blocked，不标 complete
+  - fixture 可行性（本机实测）：`C:\Windows\System32\OpenSSH\sshd.exe` 存在、服务 `sshd` 已安装但 **STOPPED**（启动需管理员）；WSL 有 Debian；无 docker。候选：①WSL Debian 内装 `openssh-server`（`wsl -u root` 起 sshd，Windows 侧连 `127.0.0.1:<port>`）——能提供 GNU `stat`/`posix-rename` 的真实 Linux 语义，最贴近契约目标；②Windows OpenSSH sshd 以临时配置 + 高位端口非管理员启动——改动最小但远端是 Windows，`stat -c`/posix-rename 语义不同；建议主用 ①，②仅作连通性兜底。两者都尚未执行，需在下一步先取得授权再动
+
+## Notes
+- 任务文件曾被 `ralph_start` 的 taskContent 覆盖，本文件已按原契约重建；后续迭代只增量更新，不再整体覆盖
+- 交接纪律：同一主题续接命名 session（`octssh-implementation`/`octssh-contract-scout`），不重复背景
+- 实现以安全失败为默认，不因服务端能力不足降低安全契约。能力阻塞要写明，不冒充完成
+- 既有测试照跑，不擅自扩建单测；设计取舍由主线程记 `.agents/notes`；AGENTS 更新前读 `docs/agents-md-spec.md`
+- Pi 实现必须完整读取关联官方 `docs/extensions.md`、`tui.md`、`packages.md` 等交叉引用，不虚构 API
+- 契约修订（迭代 1 定稿，待写入设计笔记）：①`expectedVersion` 区分强/弱指纹，edit 仅接受强指纹，弱指纹返回 `unsupported` 而非降级；②硬链接与 owner 判定改由固定 `stat` 模板承担，SFTP v3 不承担；③本地隔离 fixture 需真 OpenSSH，不用 ssh2 Server；④连接计划身份不要塞进 `parseProxyJump` 返回值（有 `deepEqual` 测试），另加独立函数
+- 未决/待核：`v1i` 强指纹在 BusyBox 等极简 `stat` 上的字段可用性需探测一次并缓存；多个固定模板向远端执行 `stat` 属“额外命令而非内容通道”，需在任务文件与文档点明其 RTT 代价
+- 派发纪律修订（迭代 3 教训）：coder 会话连续两轮在 **2100s 上限处被砍**，代码已落盘但总结丢失（两次都只剩一行）。下一轮起要求 subagent **先把交接摘要写进 `.ralph/handoff/<item>.md` 再跑最终验证**，超时也不丢证据；主线程拿不到摘要时直接按文件与探针自证，不重派同一份活
+- 迭代 4 观察：交接文件纪律**有效**——coder 仍在 1500s 触顶被砍，但 `.ralph/handoff/P1b.md` 已把 5 个文件的完成情况与真机待办写全，主线程据此只补跑离线探针即可，没有重派。下轮起把单次 spec 收得更窄（≤2–3 个文件），并明确「本轮不必做最终验证，先落交接文件」
+- 迭代 5 记录：①`evaluate.ts` 把「内建硬禁止」做成**入参** `builtinBlock`，复用现有 `buildEffectiveSecurityConfig`/`guardExecCommand` 的结果，而不是在新模块里重抄一份清单——避免两处清单漂移，这个取舍要保留；受管操作枚举取自代码里真实存在的操作名（`hosts,machine-info,exec,exec-async,upload,upload-async,download,download-async,session-get,session-grep,session-write-stdin,session-cancel,read,edit`）。②**非 git 目录按启动目录取 projectId** 是契约明写，但边缘锋利：在非 git 项目里从子目录启动 Pi 会得到另一个 projectId，已批准的规则静默不生效。是否改为向上查找项目标记（`.git`/`package.json` 等）需要用户裁决，本轮不擅自改契约。③损坏的锁文件会一直挡住规则写入直到人工删除——fail-closed 的代价，属预期
+- 迭代 7 记录：①`planEdit` 要求**同时**传 `expectedVersion`（调用方以为的版本）与 `currentVersion`（刚实测到的版本），两者分别校验 —— 这把「调用方认知」与「当前事实」分开，比只传一个 token 更难被误用，保留该形状。②`decodeFingerprint` 的 `inode`/`nlink` 是**字符串**（`mode/uid/gid/size/mtime` 是数字），因为二者来自 `stat` 文本输出；调用方比较时不要混用类型。③SFTP v3 attrs 不含 inode/nlink，因此强指纹只能由远端 `stat` 补齐 —— 这也是 edit 多 1 次 exec RTT 的原因，属已知代价
+- 迭代 8 记录：①`applyEdit` 用**依赖注入**的 `RemoteFileOps` seam —— 编排只依赖能力接口，真适配器 `sftpFileOps.ts` 只做转发、零判断。这是本轮最有价值的形状：六种结果语义与调用顺序全部能离线验满（含注入单点失败），真机只剩「适配器能否工作」一个未知，而不是「语义对不对」也要上机。②结果类型除契约六种外增加了 `no_change` 与 `dry_run`，两者都**不落盘**；这正是迭代 7 空操作问题的修法。③`rename` 阶段抛错归 `outcome_unknown` 而非 `not_written`：改名可能已生效，声明「没写」会是假话 —— 这条要作为调用方纪律保留（不自动重试，先重读核对）
+- 迭代 9 记录：①写入路径的「确认弹窗」目前只展示路径与替换目标，**不展示即将写入的 diff** —— 因为读文件要先建连，而弹窗发生在建连之前（deny 必须在建连前判定）。要做到「先看 diff 再确认」，需要允许在确认前做一次只读连接；这属于拓扑改动，本轮不动，列为后续可选改进。②`dryRun` 在命中 `ask` 时也会弹确认（它并不写盘）—— 偏保守但安全，可后续放宽为「dryRun 无需确认」。③**指纹不等于内容哈希**：同长同 mtime 的外部改写无法察觉（有复现）；文档必须写明 token 的保证边界，避免用户以为它能探测任意并发改写。④P3 的代码到此完整，真机未知项集中在三个适配函数（`createSftpFileOps`/`readAllVia`/`probeStat`）与 `stat` 模板选择上 —— 这正是「薄 seam」策略想要的结果
+- 迭代 10 记录：①**`isHolderAlive` 注入点有安全副作用（建议 P4b 修）**：租约的「异机持有者永不可抢」规则目前**依赖默认实现内部**（`defaultIsHolderAlive` 里判断 hostname），一旦调用方按接口注释「同机 pid 判活」的字面意思注入自己的实现，异机保护就被绕开 —— 我实测确实能抢到。更稳的做法是把 hostname 判断上移到 `leaseIsTakeable`（库内），注入点只负责「同机 pid 是否存活」。接口注释也应写明「实现必须对异机返回 true」。②`deliver(event)` 只收事件，`store/self/send/channelState` 全部通过 `createDelivery` 注入 —— 与 `applyEdit` 同一形状，离线可验性来自这里。③「忙碌/无会话」走 `queued` 并**不标记已投递**，这保证了「关掉自动唤醒仍能补发」；`flush` 会把投递不掉的项写回队列。④payload 只含元数据，符合「默认不塞原始日志」并要求调用方按需查日志
+- 迭代 11 记录：①上一轮我发现的 `isHolderAlive` 注入点安全缺口**已修复并验收**：异机不可抢的判断现在在库内 `leaseIsTakeable`，注入点仅负责同机 pid 判活；用「朴素判活」注入后异机仍不可抢，同机死 pid 仍可接管。这是「按文档写也不会写出不安全实现」的正确形状。②`createTaskStore` 把损坏/不可读处理成「改名保留 + 置 `storeCorrupt` 标记 + 返回空」而不是抛错 —— 数据不丢，但**调用方必须检查标记**，否则会表现成「没有任务」。③`tasks/` 目录用 `withLock` 串行化写盘，避免多进程读改写互相覆盖；任务索引与 `sessions.json` **分开存**，因而完全没碰那个 `.strict()` schema，也没触发手写测试的连锁修改 —— 这个隔离取舍要保留
+- 迭代 12 记录：①**「无合适会话」与「忙碌」是两条不同路径**：忙碌 → 入队等 `flush`；无同项目会话 → **根本不产事件**，靠下一轮重新推导（不写 `emittedEventId`）。两者都不会丢，但语义不同，文档要分开写，否则「排队」与「等待」会被混为一谈。②`withLock` **不可重入**：store 里嵌套取锁会自死锁，coder 的修法是「一次持锁完成读+迁移写」，而不是把锁做成可重入 —— `src/util/lockfile.ts` 一行未动。后续任何在锁内再调用 `store.*` 的写法都要小心。③已投递记录的 v1→v2 迁移把「无时间戳」的旧条目视为**永不被时间裁剪**，这是正确的保守方向（宁可记住久一点，也不要因缺时间而重复唤醒）。④裁剪只碰已投递集，队列独立，两者不会互相牵连
+- 迭代 16 记录：①**对抗审查的价值在本轮被实证**：三个真问题全部由 audit agent 找出，其中「rename 成功后谎报 `not_written`」是我此前 11 项假适配器探针都没覆盖到的顺序盲区（我只验了「rename 之前失败」与「rename 本身抛错」，没验「rename 之后失败」）。**教训：失败注入要覆盖操作序列的每一段，不只是每个操作。**②`operationFamily()` 是正确形状：deny/allow 都必须按族生效，否则会留下「deny 能绕过」与「allow 不生效」两种半边问题。③`ask` 的教训：三档语义里任何一档只在部分入口落地，都等于承诺了实现没有的能力——文档写 `ask` 有效之前必须先逐入口核实。④审查给出的真机清单（`posixRename` 失败时是否可能已生效、回读断连在 ssh2 里是抛错还是空 buffer、非特权 `chown` 到自身是否恒成功、BSD `stat -f` 与 `setTimes` 的秒级精度、`newVersion` 回落到 `currentToken` 后是否让下一次 edit 直接 `conflict`）已并入 P6c 待办
