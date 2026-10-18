@@ -123,3 +123,54 @@ Host octssh-fixture
 - 未执行的条目在最终报告里标 **未验（blocked）**，不计入完成。
 - 涉及远端写入的条目只在专用测试账户的临时目录上执行，不碰任何现有远端与生产路径。
 - Windows 端 Word/面板类交互在真实 Pi TUI 内完成；RPC 模式覆盖 1.5、2.5 的无 UI 分支。
+
+---
+
+## 执行结果（2026-10-18，fixture = fnos @192.168.123.133:2223, OpenSSH 9.2p1 Debian）
+
+### 第 1 组：主机密钥与指纹 — **5/5 通过**
+| # | 结果 | 证据 |
+|---|---|---|
+| 1.1 | ✅ | 真实握手指纹 `SHA256:TxFXx6qceM8QhW6NHNl5RamRjx+qZgZSJwHv5cup+u0` 与本机真 ssh（accept-new）记录一致，算法 `ssh-ed25519` 解析正确 |
+| 1.2 | ✅ | 确认后落盘 1 条；已信任连接 `extraPrompts=0` |
+| 1.3 | ✅ | 同 alias 换端口（=换端点）→ `extraPrompts=1` 重新确认；同端点换 alias 不重弹（符合「信任绑定 host:port」契约） |
+| 1.4 | ✅ | 密钥变化 → `verify=false`、`extraPrompts=0`、无「仍然继续」 |
+| 1.5 | ✅ | 无 UI → `verify=false` 且不落盘 |
+| 1.6 | ✅ | 信任表损坏 → fail closed，不弹窗 |
+| 1.6跳板 | N/A | fnos 无跳板链路 |
+
+### 第 3 组：SFTP 与 stat 模板 — **7/8 通过**
+| # | 结果 | 证据 |
+|---|---|---|
+| 3.1 | ✅ | 真机 read 返回强 token `v1i|33188|1000|1001|50|…|561401|1`（GNU stat 模板，真实 inode） |
+| 3.3 | ✅ | edit success；mode 保留（644→644）、mtime 更新、`LINE2-改` 替换成功、无残留 temp |
+| 3.4 | ✅ | 外部改动后旧 token → `conflict`，未写入 |
+| 3.6 | ✅ | 符号链接 → `rejected/symlink` |
+| 3.7 | ✅ | 硬链接 → `unsupported/hard_linked` |
+| 3.8 | ✅ | 3 MB → `rejected/too_large` |
+| 3.12 | ✅ | CRLF 文件中文替换：`"a\r\n再见\r\nb\r\n"`，CRLF 原样、无孤立换行 |
+| 3.9/3.10/3.11 | N/A | 3.9 kill 中断未编排；3.10 OpenSSH 9.2 支持 posix-rename（无「不支持」环境）；3.11 touch -r 盲区离线已有复现 |
+| 2.x | N/A | fnos 仅密钥登录，无密码账户可测（2.1–2.10 仍 blocked） |
+
+### 第 4 组：权限端到端 — **3/3 通过**
+| # | 结果 | 证据 |
+|---|---|---|
+| 4.2 | ✅ | deny edit 规则 → `blocked/project_deny`，文件未被改动（`text="perm test\n"`） |
+| 4.3 | ✅ | ask 规则端到端真的拦截一次（`prompted=1` 后放行）——迭代 16 修复的行为级验证 |
+| 4.5 | ✅ | `iptables -F` 在并存 allow 规则下仍 `blocked/blocked_executable` |
+
+### 第 6 组：跨进程 — **1/1 通过**
+| # | 结果 | 证据 |
+|---|---|---|
+| 6.1 | ✅ | 3 个真实 node 进程并发各写 5 条规则 → 15 条全部存在，无覆盖 |
+
+### 第 5 组：异步任务 — **blocked，但发现诚实失败**
+- `execAsync` 在 fnos 上明确报错 `Remote prerequisite missing: screen is required on the server` —— **fnos 未装 screen**。错误路径本身验证了「前置缺失不冒充成功」。
+- 安装 screen 需要改动 NAS 系统包，待用户决定。
+- 5.2/5.3/5.6–5.11（面板、自动唤醒、真 Pi 交互）仍需真实 Pi 扩展会话，本轮未覆盖。
+
+### 真机验收发现并修复的缺陷（2 个，commit 17ee585）
+1. **exec/exec-async 无限确认循环**：ask 命中后确认授权、重试仍被 ask 拦 → 永远弹窗。修复：`authorized` 时不再重复要求确认。**离线假依赖探针完全无法发现**——它需要「真连接 + 真确认循环」才能触发。
+2. **ssh2 `sftp.open` flags 用法错误**：传了 `{ flags: "w" }` 对象，真机报 `Unknown flags string: [object Object]`——**所有离线假适配器探针都绕过了真 ssh2**。修复 `sftpFileOps.writeFile` 与 `sftpWriteExclusive` 两处。
+
+**结论：真机验收价值被实证——两个缺陷全部只能在真机上暴露。** 剩余 blocked 项：密码登录类（无测试账户）、screen 任务类（fnos 无 screen）、真 Pi UI 交互类（面板/自动唤醒）。
