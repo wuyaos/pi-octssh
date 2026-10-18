@@ -75,10 +75,12 @@ export function planMachineConnection(machine: string) {
   const privateKey = loadFirstPrivateKey(resolved.identityFiles);
 
   if (!agent && !privateKey) {
+    // 纯密码主机（例如只配了 User/HostName 的条目）会命中这里，但它并不代表
+    // 连接会失败——密码认证照样能用。措辞必须中性，否则用户会以为出错了。
     warnings.push(
       process.platform === "win32"
-        ? "No SSH agent (SSH_AUTH_SOCK/pageant) and no readable IdentityFile found; connection may fail."
-        : "No SSH agent (SSH_AUTH_SOCK) and no readable IdentityFile found; connection may fail."
+        ? "No SSH agent (SSH_AUTH_SOCK/pageant) or readable IdentityFile; will use password or key passphrase if the host offers it."
+        : "No SSH agent (SSH_AUTH_SOCK) or readable IdentityFile; will use password or key passphrase if the host offers it.",
     );
   }
 
