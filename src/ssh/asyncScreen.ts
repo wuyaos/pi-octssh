@@ -13,7 +13,8 @@ export type StartAsyncParams = {
 
 export type StartedAsync = {
   session_id: string;
-  screenName: string;
+  backend: "screen" | "nohup";
+  screenName: string | null;
   cmdPid?: number;
   remoteDir: string;
   stdoutPath: string;
@@ -73,11 +74,9 @@ export async function startAsyncInScreen(
   const stdinPath = `${remoteDir}/stdin.fifo`;
   const stdinLogPath = `${remoteDir}/stdin.log`;
 
-  // Preflight: require screen.
+  // 后端探测：有 screen 用 screen；没有则用 nohup 保活（wrapper 状态机不变）。
   const hasScreen = await runCommand(client, wrapSh("command -v screen >/dev/null 2>&1"));
-  if (hasScreen.exitCode !== 0) {
-    throw new Error("Remote prerequisite missing: `screen` is required on the server.");
-  }
+  const backend: "screen" | "nohup" = hasScreen.exitCode === 0 ? "screen" : "nohup";
 
   const hasMkfifo = await runCommand(client, wrapSh("command -v mkfifo >/dev/null 2>&1"));
   if (hasMkfifo.exitCode !== 0) {
@@ -97,9 +96,14 @@ export async function startAsyncInScreen(
     wrapperFile,
     'OCTSSH_EOF',
     `chmod +x \"$run/wrapper.sh\"`,
-    // Run wrapper in detached screen and pass the user command as $1.
-    `screen -dmS ${quoteForSh(screenName)} sh \"$run/wrapper.sh\" ${quoteForSh(params.command)}`,
-    `screen -ls | grep -F ${quoteForSh(screenName)} >/dev/null 2>&1 || { echo 'screen session not found' 1>&2; screen -ls 1>&2 || true; exit 1; }`,
+    // 按后端分派的保活启动：screen 用 detached 会话；nohup 用忽略 HUP 的后台进程。
+    // 两者都把 wrapper 的输出发往已重定向的文件，不依赖终端。
+    backend === "screen"
+      ? `screen -dmS ${quoteForSh(screenName)} sh \"$run/wrapper.sh\" ${quoteForSh(params.command)}`
+      : `nohup sh \"$run/wrapper.sh\" ${quoteForSh(params.command)} >/dev/null 2>&1 &`,
+    ...(backend === "screen"
+      ? [`screen -ls | grep -F ${quoteForSh(screenName)} >/dev/null 2>&1 || { echo 'screen session not found' 1>&2; screen -ls 1>&2 || true; exit 1; }`]
+      : []),
     `i=0; while [ $i -lt 5 ]; do if [ -f \"$run/cmd.pid\" ]; then cat \"$run/cmd.pid\"; exit 0; fi; i=$((i+1)); sleep 1; done; echo 'cmd.pid not created' 1>&2; ls -la \"$run\" 1>&2 || true; exit 1`,
   ].join("\n");
 
@@ -180,7 +184,8 @@ export async function startAsyncInScreen(
       createdAt: now,
       updatedAt: now,
       status: "running",
-      screenName,
+      backend,
+      ...(backend === "screen" ? { screenName } : {}),
       cmdPid,
       remoteDir,
       stdoutPath,
@@ -194,7 +199,8 @@ export async function startAsyncInScreen(
 
   return {
     session_id: sessionId,
-    screenName,
+    backend,
+    screenName: backend === "screen" ? screenName : null,
     cmdPid,
     remoteDir,
     stdoutPath,

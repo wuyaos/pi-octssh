@@ -707,7 +707,17 @@ class Runtime implements OctsshRuntime {
       let remoteMeta: any = null; try { remoteMeta = meta.stdout.trim() ? JSON.parse(meta.stdout) : null; } catch { /* ignore */ }
       let status = rec.status; let exitCode = rec.exitCode ?? null;
       if (remoteMeta?.status === "running") status = "running";
-      if (remoteMeta?.status === "done") { status = remoteMeta.exitCode === 0 ? "done" : "failed"; exitCode = typeof remoteMeta.exitCode === "number" ? remoteMeta.exitCode : exitCode; }
+      if (remoteMeta?.status === "running") status = "running";
+      // 本地已判 cancelled、远端 meta 显示被信号杀掉（128+SIG，如 TERM=143）：
+      // 真实终态就是「被我们取消」，不能降级成 failed。
+      if (remoteMeta?.status === "done") {
+        if (rec.status === "cancelled" && typeof remoteMeta.exitCode === "number" && remoteMeta.exitCode >= 128) {
+          status = "cancelled";
+        } else {
+          status = remoteMeta.exitCode === 0 ? "done" : "failed";
+        }
+        exitCode = typeof remoteMeta.exitCode === "number" ? remoteMeta.exitCode : exitCode;
+      }
       if (status !== rec.status || exitCode !== (rec.exitCode ?? null)) saveSession({ ...rec, status, exitCode: exitCode ?? undefined, updatedAt: isoNow() }, getOctsshDir());
       let tails: any = null;
       if (lines) {
@@ -716,7 +726,8 @@ class Runtime implements OctsshRuntime {
         const err = await runCommand(lease.value.ssh.client, wrapSh(`tail -n ${n} "${toHomeAbs(rec.stderrPath)}" 2>/dev/null || true`));
         tails = { stdout: out.stdout, stderr: err.stdout };
       }
-      return { kind: "success", session_id: sessionId, machine: rec.machine, status, exitCode, screenName: rec.screenName, cmdPid: rec.cmdPid ?? null, tails };
+      const backend = rec.backend ?? "screen";
+      return { kind: "success", session_id: sessionId, machine: rec.machine, status, exitCode, backend, screenName: backend === "screen" ? rec.screenName ?? null : null, cmdPid: rec.cmdPid ?? null, tails };
     } finally { lease.release(); }
   }
 
@@ -792,7 +803,8 @@ class Runtime implements OctsshRuntime {
     try {
       const sig = /^[A-Z0-9]+$/.test((signal ?? "TERM").toUpperCase()) ? (signal ?? "TERM").toUpperCase() : "TERM";
       const parts = rec.cmdPid ? [`kill -s ${sig} ${rec.cmdPid} 2>/dev/null || true`] : [];
-      parts.push(`screen -S ${quoteForSh(rec.screenName)} -X quit 2>/dev/null || true`);
+      // screen 后端才退出 screen 会话；nohup 后端 kill cmdPid 后 wrapper 会自然写 done meta。
+      if ((rec.backend ?? "screen") === "screen" && rec.screenName) parts.push(`screen -S ${quoteForSh(rec.screenName)} -X quit 2>/dev/null || true`);
       await runCommand(lease.value.ssh.client, wrapSh(parts.join("; ")));
       saveSession({ ...rec, status: "cancelled", updatedAt: isoNow() }, getOctsshDir());
       return { kind: "success", session_id: sessionId, status: "cancelled", signal: sig };
@@ -1063,7 +1075,12 @@ class Runtime implements OctsshRuntime {
       if (isLocalSession(rec)) { deleteSessionFile(rec.session_id, getOctsshDir()); continue; }
       try {
         const lease = await this.pool.get(rec.machine);
-        try { if (lease.value.platform !== "windows") await runCommand(lease.value.ssh.client, wrapSh(`rm -rf "$HOME/${rec.remoteDir}" 2>/dev/null || true; screen -S ${quoteForSh(rec.screenName)} -X quit 2>/dev/null || true`)); } finally { lease.release(); }
+        try {
+          if (lease.value.platform !== "windows") {
+            const quit = (rec.backend ?? "screen") === "screen" && rec.screenName ? `; screen -S ${quoteForSh(rec.screenName)} -X quit 2>/dev/null || true` : "";
+            await runCommand(lease.value.ssh.client, wrapSh(`rm -rf "$HOME/${rec.remoteDir}" 2>/dev/null || true${quit}`));
+          }
+        } finally { lease.release(); }
       } catch { /* best effort */ }
       if (this.isCurrent(generation)) deleteSessionFile(rec.session_id, getOctsshDir());
     }

@@ -11,8 +11,11 @@ const remoteScreenSessionSchema = z
     updatedAt: z.string().min(1),
     status: z.enum(["running", "done", "failed", "cancelled"]),
 
-    // Remote `screen` session name (e.g. octssh-<id>)
-    screenName: z.string().min(1),
+    // 会话后端；旧记录无此字段时按 "screen" 处理（零迁移）。
+    backend: z.enum(["screen", "nohup"]).optional(),
+
+    // Remote `screen` session name (e.g. octssh-<id>)；仅 screen 后端有。
+    screenName: z.string().min(1).optional(),
 
     // Prefer storing both PIDs when known.
     screenPid: z.number().int().positive().optional(),
