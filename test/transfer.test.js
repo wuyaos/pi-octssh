@@ -19,6 +19,23 @@ test('walkLocal rejects symlinks instead of following directory loops', async ()
   assert.throws(() => walkLocal(root), /symlinks are not allowed/);
 });
 
+test('walkLocal rejects junctions (same reparse-point defense, no admin required)', async (t) => {
+  // 上面那条用例需要 SeCreateSymbolicLinkPrivilege（Windows 上等于管理员或开发者模式），
+  // 在没开开发者模式的机器上它连 symlink 都建不出来。junction 不需要特权，而 Node 的
+  // lstat 同样把它报成符号链接，因此这条覆盖的是同一段防御。
+  const { walkLocal } = await loadTs('transfer/localWalk.ts');
+  const root = tempDir();
+  fs.mkdirSync(path.join(root, 'nested'));
+  fs.writeFileSync(path.join(root, 'nested', 'data.txt'), 'safe');
+  try {
+    fs.symlinkSync(root, path.join(root, 'nested', 'loop'), 'junction');
+  } catch (error) {
+    t.skip(`本机不允许创建 junction: ${error.code}`);
+    return;
+  }
+  assert.throws(() => walkLocal(root), /symlinks are not allowed/);
+});
+
 test('planDownload does not create local directories', async () => {
   const { planDownload } = await loadTs('transfer/download.ts');
   const root = tempDir();
