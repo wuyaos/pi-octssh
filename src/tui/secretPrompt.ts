@@ -30,6 +30,10 @@ export type SecretPromptOptions = {
 
 const MASK = "•";
 
+/** bracketed paste 边界序列（终端在粘贴前后各发一个）。 */
+const PASTE_START = "\u001b[200~";
+const PASTE_END = "\u001b[201~";
+
 function stripPrintable(data: string): string | undefined {
   // 只接受单个可打印字符；控制键由下面的显式分支处理。
   if (data.length === 1) {
@@ -58,8 +62,90 @@ export class SecretPrompt implements Component, Focusable {
     this.mask = options.mask ?? MASK;
   }
 
+  /** 处在 bracketed paste 内部（序列可能被拆到多个 chunk）。 */
+  private pasting = false;
+
+  /**
+   * 处理 bracketed paste。
+   *
+   * 返回 true 表示这个 chunk 已被粘贴逻辑消费，调用方不要再按键处理。
+   * 粘贴内容**一律不走明文回显**：只进 this.value，渲染仍是掩码。
+   */
+  private consumePaste(data: string): boolean {
+    let consumed = false;
+    let rest = data;
+
+    if (this.pasting) {
+      const end = rest.indexOf(PASTE_END);
+      if (end === -1) {
+        // 整段仍在粘贴中。
+        this.value += rest;
+        return true;
+      }
+      this.value += rest.slice(0, end);
+      this.pasting = false;
+      rest = rest.slice(end + PASTE_END.length);
+      consumed = true;
+    }
+
+    for (;;) {
+      const start = rest.indexOf(PASTE_START);
+      if (start === -1) break;
+
+      const before = rest.slice(0, start);
+      if (before) this.value += before;
+      const afterStart = rest.slice(start + PASTE_START.length);
+      const end = afterStart.indexOf(PASTE_END);
+      consumed = true;
+
+      if (end === -1) {
+        this.value += afterStart;
+        this.pasting = true;
+        return true;
+      }
+
+      this.value += afterStart.slice(0, end);
+      rest = afterStart.slice(end + PASTE_END.length);
+    }
+
+    if (consumed) {
+      // 粘贴边界之后的残余内容按普通输入处理（多为换行或控制键）。
+      if (rest === "\r" || rest === "\n") {
+        this.finish(this.value);
+        return true;
+      }
+      if (rest === "\u001b") {
+        this.finish(undefined);
+        return true;
+      }
+      if (rest) this.value += rest;
+    }
+    return consumed;
+  }
+
+  /** 全为可打印字符（粘贴内容里可能包含换行，这里允许 \n 一并进值）。 */
+  private isAllPrintable(data: string): boolean {
+    for (const ch of data) {
+      const code = ch.codePointAt(0) ?? 0;
+      if (code === 0x0a || code === 0x0d) continue;
+      if (code < 0x20 || code === 0x7f) return false;
+    }
+    return true;
+  }
+
   handleInput(data: string): void {
     if (this.finished) return;
+
+    // bracketed paste：终端会把整段粘贴内容包在 \x1b[200~ … \x1b[201~ 之间。
+    // 中间内容原样收下（仍然只显示掩码），并在跨 chunk 时记住「还在粘贴中」。
+    const pasteHandled = this.consumePaste(data);
+    if (pasteHandled) return;
+
+    // 没有序列、但一次来了多个普通字符（部分终端/输入法如此）：全部追加。
+    if (data.length > 1 && this.isAllPrintable(data)) {
+      this.value += data;
+      return;
+    }
 
     if (data === "\r" || data === "\n") {
       this.finish(this.value);
