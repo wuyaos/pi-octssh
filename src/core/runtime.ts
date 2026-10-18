@@ -83,6 +83,8 @@ export interface OctsshRuntime {
   };
   pruneTaskDelivered(options?: { maxAgeMs?: number; maxEntries?: number }): { removed: number; kept: number };
   taskStoreStatus(): { storeCorrupt: boolean; corruptFiles: { file: string; renamedTo: string; error: string }[] };
+  /** 连接池实况：`/octssh status` 展示用。`size` 是当前缓存的连接数（含空闲）。 */
+  poolStats(): { connections: number; maxConnections: number };
   readFile(params: { machine: string; path: string; offset?: number; limit?: number; projectId?: string; signal?: AbortSignal; authorization?: Authorization }): Promise<ReadRemoteFileResult | BlockedResult | NeedsConfirmation>;
   editFile(params: { machine: string; path: string; expectedVersion: string; oldText: string; newText: string; dryRun?: boolean; projectId?: string; signal?: AbortSignal; authorization?: Authorization }): Promise<ApplyEditResult | NeedsConfirmation | BlockedResult>;
   getSession(sessionId: string, lines?: number, projectId?: string): Promise<unknown>;
@@ -987,6 +989,10 @@ class Runtime implements OctsshRuntime {
   /** 面板用：任务存储状态。 */
   taskStoreStatus(): { storeCorrupt: boolean; corruptFiles: { file: string; renamedTo: string; error: string }[] } {
     return this.taskStore.status();
+  }
+
+  poolStats(): { connections: number; maxConnections: number } {
+    return { connections: this.pool.size(), maxConnections: this.cfg.maxConnections };
   }
 
   /**

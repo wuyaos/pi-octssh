@@ -16,6 +16,7 @@ import { projectDisplayPath, projectIdFromCwd } from "../src/security/project.ts
 import { addRule, removeRule, listRules } from "../src/security/rules.ts";
 import { describeScope, scopeRule, type OperationScope } from "../src/security/authorize.ts";
 import { SecretPrompt } from "../src/tui/secretPrompt.ts";
+import { formatDuration, renderDetails } from "../src/tui/toolDisplay.ts";
 import {
   clearAllCredentials,
   credentialCacheSize,
@@ -498,17 +499,19 @@ function finish(operation: string, value: unknown, successSummary: string): Tool
   return makeResult(operation, value, successSummary);
 }
 
+/* 结果正文的按类型渲染在 src/tui/toolDisplay.ts（纯字符串、可离线验证）。 */
+
 function renderResult(result: ToolResult, expanded: boolean, theme: any) {
-  const details = result.details;
+  const details = result.details as { operation?: string; kind: string; summary: string; data?: unknown } | undefined;
   if (!details) {
     const content = result.content[0];
     return new Text(content?.type === "text" ? content.text : "", 0, 0);
   }
   const color = details.kind === "success" ? "success" : details.kind === "blocked" ? "warning" : "error";
   const prefix = details.kind === "success" ? "✓ " : details.kind === "blocked" ? "⚠ " : "✗ ";
-  const firstLine = theme.fg(color, prefix) + theme.fg("muted", details.summary);
-  if (!expanded) return new Text(firstLine, 0, 0);
-  return new Text(`${firstLine}\n${theme.fg("toolOutput", stringify(details.data))}`, 0, 0);
+  const head = theme.fg(color, prefix) + theme.fg("muted", details.summary);
+  const body = renderDetails(details.operation, details.data, theme, expanded);
+  return new Text(body.length > 0 ? `${head}\n${body.join("\n")}` : head, 0, 0);
 }
 
 function countRunningSessions(): number {
@@ -780,14 +783,14 @@ export default function octsshExtension(pi: ExtensionAPI) {
   const execSchema = Type.Object({
     machine: Type.String({ description: "ssh_config 中的主机名" }),
     command: Type.String({ description: "要在远端执行的 shell 命令" }),
-    mode: Type.Optional(Type.Union([Type.Literal("sync"), Type.Literal("async")], { description: "同步等待或在远端 screen 后台运行；默认 sync" })),
+    mode: Type.Optional(Type.Union([Type.Literal("sync"), Type.Literal("async")], { description: "同步等待，或在远端后台异步运行（有 screen 用 screen，否则用 nohup）；默认 sync" })),
     sudo: Type.Optional(Type.Boolean({ description: "是否通过 passwordless sudo 执行" })),
   });
 
   pi.registerTool({
     name: "octssh_exec",
     label: "OctSSH Exec",
-    description: "在指定 SSH 主机执行命令。支持同步、远端 screen 异步任务和 passwordless sudo；危险命令由用户在 Pi 界面人工确认。",
+    description: "在指定 SSH 主机执行命令。支持同步执行、远端后台异步任务（有 screen 用 screen，否则自动用 nohup）与 passwordless sudo；危险命令由用户在 Pi 界面人工确认。",
     promptSnippet: "在远端 SSH 主机执行命令",
     parameters: execSchema,
     async execute(_id, params, signal, _onUpdate, ctx) {
@@ -946,6 +949,17 @@ export default function octsshExtension(pi: ExtensionAPI) {
         return makeError("read", error);
       }
     },
+    renderCall(args, theme) {
+      const window = args.offset || args.limit ? theme.fg("muted", ` ${args.offset ?? 1}${args.limit ? `+${args.limit}` : "+"}`) : "";
+      return new Text(
+        `${theme.fg("toolTitle", theme.bold("octssh read"))} ${theme.fg("accent", args.machine)}${window}\n${theme.fg("dim", args.path)}`,
+        0,
+        0,
+      );
+    },
+    renderResult(result, options, theme) {
+      return renderResult(result as ToolResult, options.expanded, theme);
+    },
   });
 
   const editSchema = Type.Object({
@@ -987,6 +1001,18 @@ export default function octsshExtension(pi: ExtensionAPI) {
       } catch (error) {
         return makeError("edit", error);
       }
+    },
+    renderCall(args, theme) {
+      const oldText = typeof args.oldText === "string" ? (args.oldText.length > 60 ? `${args.oldText.slice(0, 57)}...` : args.oldText) : "";
+      const dryRun = args.dryRun ? theme.fg("muted", " dryRun") : "";
+      return new Text(
+        `${theme.fg("toolTitle", theme.bold("octssh edit"))} ${theme.fg("accent", args.machine)}${dryRun}\n${theme.fg("dim", args.path)}${oldText ? `\n${theme.fg("dim", `- ${oldText}`)}` : ""}`,
+        0,
+        0,
+      );
+    },
+    renderResult(result, options, theme) {
+      return renderResult(result as ToolResult, options.expanded, theme);
     },
   });
 
@@ -1101,8 +1127,16 @@ export default function octsshExtension(pi: ExtensionAPI) {
       }
       const uptimeSeconds = runtimeStartedAt ? Math.floor((Date.now() - runtimeStartedAt) / 1000) : 0;
       const runningSessions = countRunningSessions();
+      const pool = runtime.poolStats();
+      const credentials = credentialCacheSize();
       ctx.ui.notify(
-        `OctSSH: 运行中 · ${uptimeSeconds}s · 活跃 session ${runningSessions} · 连接池大小不可用（Core 未公开统计）`,
+        [
+          `OctSSH: 运行中 · ${formatDuration(uptimeSeconds)}`,
+          `活跃 session ${runningSessions}`,
+          `连接池 ${pool.connections}/${pool.maxConnections}`,
+          `凭据缓存 ${credentials}`,
+          `自动唤醒 ${loadConfig(getOctsshDir()).taskNotify.autoWake ? "开" : "关"}`,
+        ].join(" · "),
         "info",
       );
     },

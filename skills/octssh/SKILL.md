@@ -1,6 +1,6 @@
 ---
 name: octssh
-description: 使用 Pi 原生 OctSSH 工具操作 SSH 远程主机。适用于在 minipc、qnap、fnos、interserver、para-GPU-N40、para-GPU-N56、para-CPU-A6 等 ssh_config 主机上执行命令、部署、上传下载、查询或取消后台任务。触发词：SSH、服务器、远程执行、部署到、上传到服务器、从服务器下载、重启远程服务、查看远端日志。
+description: 用 Pi 原生 OctSSH 工具操作 SSH 远端主机：执行命令、上传下载、后台异步任务、远端文本读取与精确编辑、部署与排查。触发词：SSH、服务器、远程执行、部署到、上传到服务器、从服务器下载、重启远程服务、查看远端日志、远端改配置。
 ---
 
 # pi-octssh — SSH 远程操作
@@ -12,7 +12,7 @@ description: 使用 Pi 原生 OctSSH 工具操作 SSH 远程主机。适用于�
 | 工具 | 用途 |
 |---|---|
 | `octssh_hosts` | 列出 SSH 主机；读取或刷新单台主机信息 |
-| `octssh_exec` | 同步执行命令，或在远端 `screen` 中启动异步任务；可选 passwordless sudo |
+| `octssh_exec` | 同步执行命令，或在远端后台启动异步任务（有 `screen` 用 `screen`，否则自动用 `nohup`）；可选 passwordless sudo |
 | `octssh_transfer` | 通过 SFTP 上传或下载文件/目录；支持同步和异步传输 |
 | `octssh_session` | 查询异步任务、搜索日志、写入 stdin、取消任务 |
 | `octssh_read` | 读取远端文本文件；返回**整份文件**的版本 token（可用于 edit）与行窗口 |
@@ -136,11 +136,24 @@ octssh_edit({
 - 连接需要密码或私钥口令时，会在遮罩输入框中向你索取；密码不进入模型上下文、不落盘。取消输入即停止连接。
 - **项目权限不是沙箱**：文件规则只约束插件的文件操作，不构成任意 shell 的文件访问隔离。允许执行某条命令，即代表信任该命令及其引用的脚本。
 
+
+## 人工入口（由用户执行，模型不能代替批准）
+
+| 命令 | 作用 |
+|---|---|
+| `/octssh` | 状态：运行时长、活跃任务数、连接池占用、凭据缓存条数、自动唤醒开关 |
+| `/octssh trust [forget <host:port>]` | 列出/移除主机密钥信任；密钥合法轮换后唯一的出路 |
+| `/octssh permissions [remove <id>]` | 查看/移除当前项目的持久规则 |
+| `/octssh tasks [wake on\|off]` | 打开任务面板；控制任务完成是否自动开新回合 |
+| `/octssh credentials clear` | 清除进程内的密码与私钥口令缓存 |
+
+模型**没有**修改权限规则、清除禁止项或批准危险操作的工具；这些只能由用户在界面内完成。
 ## 异步任务生命周期
 
-- `octssh_exec` 的异步模式使用远端 `screen`，任务在远端持续运行。
+- `octssh_exec` 的异步模式在远端后台运行：主机装了 `screen` 就用 `screen`，否则自动用 `nohup`（无需用户装包）。返回值里的 `backend` 会写明用的哪一种。
+- 两种后端都靠远端 `~/.octssh/runs/<session_id>/` 下的文件记录状态（`meta.json` 退出码、`stdout.log`/`stderr.log` 输出、`stdin.fifo` 输入管道），因此输出**不在本地**：要读日志用 `octssh_session`，或用 `octssh_exec` 直接读那些文件。
 - Pi 重启或 `/reload` 不会杀死已经成功启动的远端任务；之后可继续用 `octssh_session` 查询。
-- 异步上传和下载运行在 Pi 进程内，Pi 退出或 reload 时会中断；它们不等同于远端 `screen`。
+- 异步上传和下载运行在 Pi 进程内，Pi 退出或 reload 时会中断；它们不等同于远端后台任务（本地只留一份 `localLogPath` 日志）。
 - 使用 `octssh_session({ action: "cancel", ... })` 明确终止任务，不要把停止本地轮询当作远端任务已经停止。
 
 ## 平台支持
@@ -151,9 +164,9 @@ Windows、Linux、macOS 均支持。连接信息默认读取本机 OpenSSH 配�
 
 ### 远端服务器
 
-- Linux、macOS、FreeBSD 等 POSIX 远端：同步执行、SFTP、sudo、`screen` 异步任务。
-- macOS/FreeBSD 使用异步模式前需安装 `screen`。
-- Windows OpenSSH 远端：仅支持同步执行和 SFTP；不支持 POSIX `sudo` 或 `screen` 异步任务。
+- Linux、macOS、FreeBSD 等 POSIX 远端：同步执行、SFTP、sudo、后台异步任务（`screen` 或 `nohup`，无需预装）。
+- 远端需要 `mkfifo`（几乎所有 POSIX 系统都有）；缺失时异步任务会明确报错，不会假装启动成功。
+- Windows OpenSSH 远端：仅支持同步执行和 SFTP；不支持 POSIX `sudo`，也没有 `screen`/`nohup`，因此不能用异步任务。
 
 ## 使用边界
 
