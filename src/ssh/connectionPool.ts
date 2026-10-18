@@ -129,6 +129,21 @@ export class ConnectionPool<K, T> {
     await Promise.allSettled(entries.map((entry) => Promise.resolve(this.closeFn(entry.value))));
   }
 
+  /**
+   * 断开所有缓存连接，但池本身继续可用。
+   *
+   * 与 `closeAll()` 的区别是**不置 closed**：`closeAll()` 是关闭语义，之后
+   * 任何 `get()` 都会抛错，只能用于 shutdown。用户主动「清凭据并断开连接」
+   * 之后还要能继续用，因此需要这个。
+   */
+  async dropAll(): Promise<number> {
+    await Promise.allSettled([...this.inflight.values()]);
+    const entries = [...this.entries.values()];
+    this.entries.clear();
+    await Promise.allSettled(entries.map((entry) => Promise.resolve(this.closeFn(entry.value))));
+    return entries.length;
+  }
+
   async sweep(now = Date.now()) {
     if (this.closed) return;
     for (const [key, entry] of this.entries) {

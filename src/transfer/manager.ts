@@ -43,6 +43,41 @@ export async function shutdownTransfers(reason = "interrupted") {
   }
 }
 
+
+export type ActiveTransferSummary = {
+  sessionId: string;
+  direction: "upload" | "download";
+  machine: string;
+  localPath: string;
+  remotePath: string;
+};
+
+/**
+ * 把 session id 映射成可展示的传输摘要。
+ *
+ * 单独导出是为了可测：活跃表是模块级 Map，没有注入点，而「谁在跑」这句话
+ * 在确认框里必须准确——错了要么白问一次，要么真的踩掉正在传的文件。
+ */
+export function summarizeTransfers(sessionIds: readonly string[], baseDir = getOctsshDir()): ActiveTransferSummary[] {
+  const out: ActiveTransferSummary[] = [];
+  for (const sessionId of sessionIds) {
+    const rec = loadSession(sessionId, baseDir);
+    if (!rec || !isTransferSession(rec)) continue;
+    out.push({
+      sessionId,
+      direction: rec.direction,
+      machine: rec.machine,
+      localPath: rec.localPath,
+      remotePath: rec.remotePath,
+    });
+  }
+  return out;
+}
+
+/** 当前进程内仍在跑的传输（进程内传输随 Pi 退出而中断，因此以活跃表为准）。 */
+export function listActiveTransfers(baseDir = getOctsshDir()): ActiveTransferSummary[] {
+  return summarizeTransfers([...runtimes.keys()], baseDir);
+}
 type Common = { client: Client; machine: string; localPath: string; remotePath: string; release: () => void };
 export function startUploadAsync(params: Common & { plan: UploadPlan }) {
   return startTransfer("upload", params, async (abort, sessionId, baseDir) => {

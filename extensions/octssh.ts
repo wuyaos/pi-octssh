@@ -1117,8 +1117,37 @@ export default function octsshExtension(pi: ExtensionAPI) {
         return;
       }
       if (argv[0] === "credentials" && argv[1] === "clear") {
+        // 「清除凭据」在用户眼里等于「退出登录」，但已认证的连接还在池里
+        // （空闲最多 idleTtlSeconds 才断），因此默认连连接一起断。
+        // 有进程内传输在跑时先确认：那会被打断，而远端 screen/nohup 任务不受影响。
+        const transfers = runtime ? runtime.activeTransfers() : [];
+        let dropConnections = true;
+
+        if (transfers.length > 0) {
+          const list = transfers
+            .map((t) => `${t.direction === "upload" ? "上传" : "下载"} ${t.localPath} → ${t.machine}:${t.remotePath}`)
+            .join("\n");
+          const choice = await ctx.ui.select(
+            [
+              `OctSSH: 当前有 ${transfers.length} 个传输任务在跑：`,
+              list,
+              "",
+              "清除凭据并断开连接会让这些传输**失败**；远端 screen/nohup 后台任务不受影响。要怎么做？",
+            ].join("\n"),
+            ["清除凭据并断开连接（传输会失败）", "只清除凭据，保留已连接的会话", "取消"],
+          );
+          if (choice === undefined || choice === "取消") return;
+          dropConnections = choice === "清除凭据并断开连接（传输会失败）";
+        }
+
         const cleared = clearAllCredentials();
-        ctx.ui.notify(`OctSSH: 已清除 ${cleared} 条进程内凭据缓存（剩 ${credentialCacheSize()} 条）。`, "info");
+        const closed = runtime && dropConnections ? await runtime.dropConnections() : 0;
+        const tail = runtime
+          ? dropConnections
+            ? `已断开 ${closed} 条连接；下次执行命令会重新认证。`
+            : "已连接会话保留（仍可免密执行，空闲超时后自动断开）。"
+          : "运行时未启动，无连接可断。";
+        ctx.ui.notify(`OctSSH: 已清除 ${cleared} 条进程内凭据缓存（剩 ${credentialCacheSize()} 条）；${tail}`, "info");
         return;
       }
       if (!runtime) {

@@ -25,7 +25,7 @@ import { collectExtendedInfo } from "../init/extended.ts";
 import { guardExecCommand } from "../security/policy.ts";
 import { planUpload, findUploadConflicts, performUpload } from "../transfer/upload.ts";
 import { planDownload, findDownloadConflicts, performDownload } from "../transfer/download.ts";
-import { startUploadAsync, startDownloadAsync, cancelTransfer, shutdownTransfers } from "../transfer/manager.ts";
+import { startUploadAsync, startDownloadAsync, cancelTransfer, listActiveTransfers, shutdownTransfers } from "../transfer/manager.ts";
 import { withSftp, type SftpClient } from "../ssh/sftp.ts";
 import { applyEdit, type RemoteFileOps, type ApplyEditResult } from "../remote/applyEdit.ts";
 import { createSftpFileOps } from "../remote/sftpFileOps.ts";
@@ -85,6 +85,10 @@ export interface OctsshRuntime {
   taskStoreStatus(): { storeCorrupt: boolean; corruptFiles: { file: string; renamedTo: string; error: string }[] };
   /** 连接池实况：`/octssh status` 展示用。`size` 是当前缓存的连接数（含空闲）。 */
   poolStats(): { connections: number; maxConnections: number };
+  /** 进程内仍在跑的异步传输；清凭据前用它判断断开会踩到什么。 */
+  activeTransfers(): { sessionId: string; direction: "upload" | "download"; machine: string; localPath: string; remotePath: string }[];
+  /** 清凭据并「退出登录」用：断开所有缓存连接，但运行时继续可用。返回断开条数。 */
+  dropConnections(): Promise<number>;
   readFile(params: { machine: string; path: string; offset?: number; limit?: number; projectId?: string; signal?: AbortSignal; authorization?: Authorization }): Promise<ReadRemoteFileResult | BlockedResult | NeedsConfirmation>;
   editFile(params: { machine: string; path: string; expectedVersion: string; oldText: string; newText: string; dryRun?: boolean; projectId?: string; signal?: AbortSignal; authorization?: Authorization }): Promise<ApplyEditResult | NeedsConfirmation | BlockedResult>;
   getSession(sessionId: string, lines?: number, projectId?: string): Promise<unknown>;
@@ -993,6 +997,14 @@ class Runtime implements OctsshRuntime {
 
   poolStats(): { connections: number; maxConnections: number } {
     return { connections: this.pool.size(), maxConnections: this.cfg.maxConnections };
+  }
+
+  activeTransfers() {
+    return listActiveTransfers(getOctsshDir());
+  }
+
+  async dropConnections(): Promise<number> {
+    return this.pool.dropAll();
   }
 
   /**
