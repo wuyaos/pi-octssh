@@ -1,4 +1,5 @@
 import os from "node:os";
+import fs from "node:fs";
 import { loadConfig } from "../state/config.ts";
 import { getOctsshDir } from "../state/paths.ts";
 import { resolveHostConfig } from "./config/resolve.ts";
@@ -57,6 +58,37 @@ export type MachineConnectPlan = {
   warnings: string[];
 };
 
+
+/** Windows 上 OpenSSH agent 的唯一可靠地址（命名管道）。 */
+export const WINDOWS_OPENSSH_AGENT_PIPE = "\\\\.\\pipe\\openssh-ssh-agent";
+
+/**
+ * 解析 ssh-agent 地址。
+ *
+ * ssh2 的 `agent` 要的是**地址**（Unix socket 路径，或 Windows 上的命名管道 /
+ * 字面量 `"pageant"`），不是 PID。此前把 `SSH_AGENT_PID` 直接传进去，等于让
+ * ssh2 去连一个叫 "12345" 的 socket——只要该变量存在，agent 认证必然失败。
+ *
+ * 因此这里只认可用的地址：
+ * - Windows：OpenSSH agent 的命名管道（存在才用）。Git Bash/MSYS 的
+ *   `SSH_AUTH_SOCK` 是虚拟路径，Node 连不上，忽略；Pageant 需要显式配置，
+ *   不做自动探测（探测不到就传 `"pageant"` 会让不装 Pageant 的机器认证失败）。
+ * - 其它平台：`SSH_AUTH_SOCK`。
+ */
+export function resolveAgentAddress(params: {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  exists?: (path: string) => boolean;
+} = {}): string | undefined {
+  const platform = params.platform ?? process.platform;
+  const env = params.env ?? process.env;
+  const exists = params.exists ?? ((p: string) => { try { return fs.existsSync(p); } catch { return false; } });
+  if (platform === "win32") {
+    return exists(WINDOWS_OPENSSH_AGENT_PIPE) ? WINDOWS_OPENSSH_AGENT_PIPE : undefined;
+  }
+  const sock = env.SSH_AUTH_SOCK;
+  return sock ? sock : undefined;
+}
 export function planMachineConnection(machine: string) {
   const cfg = loadConfig(getOctsshDir());
 
@@ -67,11 +99,7 @@ export function planMachineConnection(machine: string) {
   const port = resolved.port ?? 22;
   const username = resolved.user ?? defaultUsername();
 
-  // Windows 原生 OpenSSH 使用 pageant/named pipe,通常不设 SSH_AUTH_SOCK。
-  // Git Bash / WSL 下仍可能有 SSH_AUTH_SOCK。
-  const agent =
-    process.env.SSH_AUTH_SOCK ||
-    (process.platform === "win32" ? process.env.SSH_AGENT_PID : undefined);
+  const agent = resolveAgentAddress();
   const privateKey = loadFirstPrivateKey(resolved.identityFiles);
 
   if (!agent && !privateKey) {
