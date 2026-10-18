@@ -100,7 +100,14 @@ export function projectIdFromCwd(cwd: string): string {
   return `proj-v1:${digest}`;
 }
 
-/** 供 UI 展示的可读路径（projectId 本身是不可逆摘要）。 */
+/**
+ * 供 UI 展示的可读路径（projectId 本身是不可逆摘要）。
+ *
+ * 与 id 用的规范化形式刻意分开：id 要跨平台稳定（分隔符统一、盘符小写），
+ * 展示则应回到本机习惯的样子——Windows 上显示 `C:\Users\...` 而不是
+ * `c:/Users/...`。realpath 顺带把盘符大小写还原成真实值。
+ */
 export function projectDisplayPath(cwd: string): string {
-  return projectRootFromCwd(cwd);
+  const root = projectRootFromCwd(cwd);
+  return tryRealpath(root) ?? path.normalize(root);
 }

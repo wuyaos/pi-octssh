@@ -222,5 +222,5 @@ Host octssh-fixture
 **D. 时间尺度**
 保留期清理（`retentionDays` 到期删远端 run 目录）· `outcome_unknown` 时 temp 是否残留
 
-**E. 验证资产的结构性缺口**
-仓库 22 个测试覆盖的是**旧子系统**（pool / proxyjump / resolve / shell / state / transfer / cleanup）；六项新功能**没有仓库测试**，其验证证据全在我写的临时探针（`C:/tmp/octssh-fp/*.cjs`，**未入库**）与真机记录里。探针不在仓库 → 无法复跑、无法回归。若要长期维护，应把关键探针（编辑编排结果语义、裁决回放、投递去重、项目身份）收成仓库测试。
+**E. 验证资产（已补上）**
+关键探针已收成仓库测试（`test/remote-edit.test.js` 13 条、`test/policy.test.js` 12 条、`test/tasks-delivery.test.js` 11 条、`test/project-identity.test.js` 5 条），`npm test` 从 22 条增至 63 条。余下未入仓库的临时探针只覆盖真机链路（`C:/tmp/octssh-fp/*.cjs`），那些本来就依赖真实主机，不适合进单元测试。
