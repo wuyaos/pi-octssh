@@ -185,3 +185,16 @@ Host octssh-fixture
 | 5.x stdin FIFO | ✅ | 写 11 字节成功，回读 `got:hello-fifo\n`，status=done |
 | 5.6 重启探活 | ✅ | 新 runtime 实例（模拟 Pi 重启）读旧记录探到 `running` |
 | 有 screen 主机回归 | ✅（代码路径） | 探测命中时走原 launcher，screen 分支语句未变 |
+
+## 补充验收：密码认证（2026-10-18，fixture = WSL Debian sshd 127.0.0.1:2224，OpenSSH 9.2p1）
+| # | 结果 | 证据 |
+|---|---|---|
+| 2.1 | ✅ | 正确密码 → `success`，`stdout="PASSWORD-OK\noctssh-test"`，1 次弹窗 |
+| 2.2 | ✅ | 错误密码 → **恰好 2 次**弹窗后 `SSH authentication failed`，停止不重试 |
+| 2.3 | ✅ | 取消（prompt 返回 undefined）→ **1 次**即停：`This host needs a password or private key passphrase…` |
+| 2.4 | ✅ | 第二条命令 `prompts=1`（缓存命中，不再弹） |
+| 2.6 | ✅ | 全量扫描 `~/.octssh` 递归所有文件，密码明文 0 命中 |
+| 2.9 | ✅ | 两个并行 exec 首连 → 只弹 1 次（请求合并） |
+| 2.7/2.8/2.10 | N/A | 2.7 私钥口令走同一 prompt 管线（离线已验语义）；2.8 需要服务端改 keyboard-interactive-only；2.10 网络错误分类为静态取证 |
+
+**剩余 blocked 仅剩：真 Pi UI 交互类**（遮罩输入组件渲染、四选项弹窗、任务面板、自动唤醒——需要在真实 Pi 会话里人工走一遍）。2.1–2.9 的 SSH 层密码认证至此全部真机验证完毕。
