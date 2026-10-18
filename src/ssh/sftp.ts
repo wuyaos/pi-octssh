@@ -164,11 +164,8 @@ export async function sftpWriteExclusive(
   bytes: Buffer,
   mode?: number,
 ): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const options: Record<string, unknown> = { flags: "wx" };
-    if (mode !== undefined) options.mode = mode;
-    sftp.open(remotePath, options, (err: any, handle: Buffer) => {
-      if (err) return reject(err);
+  const writeAll = (handle: Buffer) =>
+    new Promise<void>((resolve, reject) => {
       let offset = 0;
       const writeNext = () => {
         if (offset >= bytes.length) {
@@ -184,6 +181,21 @@ export async function sftpWriteExclusive(
         });
       };
       writeNext();
+    });
+  // ssh2 的 open 签名是 (path, flags 字符串, attributes, cb)；mode 走 attributes，
+  // 不是 { flags, mode } 对象——那会变成 "Unknown flags string: [object Object]"。
+  if (mode !== undefined) {
+    return new Promise<void>((resolve, reject) => {
+      sftp.open(remotePath, "wx", mode, (err: any, handle: Buffer) => {
+        if (err) return reject(err);
+        writeAll(handle).then(resolve, reject);
+      });
+    });
+  }
+  return new Promise<void>((resolve, reject) => {
+    sftp.open(remotePath, "wx", (err: any, handle: Buffer) => {
+      if (err) return reject(err);
+      writeAll(handle).then(resolve, reject);
     });
   });
 }

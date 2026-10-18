@@ -80,7 +80,8 @@ export function createSftpFileOps(deps: SftpFileOpsDeps): RemoteFileOps {
       // 不用 createWriteStream：它的 "close" 在错误路径上也可能先触发，
       // 分不清「写完」与「写一半就断了」。
       await new Promise<void>((resolve, reject) => {
-        sftp.open(path, { flags: "w" }, (openErr: any, handle: Buffer) => {
+        // ssh2 的 open 第二参是 flags 字符串（"w"/"wx"…），不是 { flags } 对象。
+        sftp.open(path, "w", (openErr: any, handle: Buffer) => {
           if (openErr) return reject(openErr);
           let offset = 0;
           const writeNext = () => {

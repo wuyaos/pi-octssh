@@ -351,7 +351,9 @@ class Runtime implements OctsshRuntime {
       }
 
       const needsConfirm = guard.action === "needs_confirmation" || post.decision === "ask";
-      if (needsConfirm && post.decision !== "allow") {
+      // authorized=true 表示调用方已为本次 payload 消费过一次性授权：
+      // ask 再拦一次会形成「确认→重试→仍 ask」的无限确认循环。
+      if (needsConfirm && post.decision !== "allow" && !authorized) {
         const preview = guard.action === "needs_confirmation" ? guard.preview : this.askPreview(post.rule ? `Matched project rule ${post.rule.id} (ask).` : "No project rule matched; confirmation required.");
         const message = guard.action === "needs_confirmation" ? guard.message : "该操作需要确认。";
         return this.requestAuthorization("exec", payload, message, preview, scope);
@@ -389,7 +391,7 @@ class Runtime implements OctsshRuntime {
       }
 
       const needsConfirm = guard.action === "needs_confirmation" || post.decision === "ask";
-      if (needsConfirm && post.decision !== "allow") {
+      if (needsConfirm && post.decision !== "allow" && !authorized) {
         const preview = guard.action === "needs_confirmation" ? guard.preview : this.askPreview(post.rule ? `Matched project rule ${post.rule.id} (ask).` : "No project rule matched; confirmation required.");
         const message = guard.action === "needs_confirmation" ? guard.message : "该操作需要确认。";
         return this.requestAuthorization("exec", payload, message, preview, scope);
