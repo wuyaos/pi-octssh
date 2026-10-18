@@ -198,3 +198,29 @@ Host octssh-fixture
 | 2.7/2.8/2.10 | N/A | 2.7 私钥口令走同一 prompt 管线（离线已验语义）；2.8 需要服务端改 keyboard-interactive-only；2.10 网络错误分类为静态取证 |
 
 **剩余 blocked 仅剩：真 Pi UI 交互类**（遮罩输入组件渲染、四选项弹窗、任务面板、自动唤醒——需要在真实 Pi 会话里人工走一遍）。2.1–2.9 的 SSH 层密码认证至此全部真机验证完毕。
+
+## 补充验收：extension 层端到端（2026-10-18，真实 Pi 进程 `pi -p`）
+| 项 | 结果 | 证据 |
+|---|---|---|
+| 工具注册 + 真实调用 | ✅ | `pi -p "用 octssh_hosts 列出主机"` → 模型回报「共 9 个主机，第一个是 fnos」 |
+| 无 UI fail-closed | ✅ | `octssh_edit`（fnos，无 UI）→ `blocked / confirmation_ui_unavailable`，**未写入** |
+| blocked 不留痕 | ✅ | 目标文件仍为 `nohup-alive/nohup-done`；目录内无 `.octssh-*` temp 残留 |
+
+此前所有真机验收都是**直接调用 runtime**，本次是首次经**扩展工具层**（工具注册 → 参数校验 → 裁决 → 结果回传）跑通。
+
+## 仍未验证（2026-10-18 盘点）
+
+**A. 需要真 Pi 人工交互（必须用户在 TUI 里走）**
+遮罩密码框渲染 · 真终端 bracketed paste（Windows Terminal / niu）· 主机指纹确认框 · 四选项弹窗（含 >10 文件时不提供「始终允许」）· `/octssh tasks` 面板与面板内取消 · 自动唤醒（idle 开新回合 / wake off 只记录 / 忙碌排队后补发）· `storeCorrupt` 一次性提示 · 重启 Pi 后规则仍生效 · 重启 Pi 后补报完成通知 · 真实通知正文不含命令与日志 · `.pi/octssh.json` 标记在真 Pi 下命中同一项目 · skill 描述改短后的触发效果 · 工具显示真实渲染与 Ctrl+O 展开 · `/octssh` 状态真实数字（连接池/凭据缓存）
+
+**B. 需要特殊服务端环境**
+2.7 加密私钥 passphrase 真机（可用 WSL 造带口令的 key）· 2.8 keyboard-interactive-only 服务端（改 sshd 配置即可）· 3.10 不支持 `posix-rename` 的服务器（OpenSSH 均支持，需换实现）· 1.6 ProxyJump 跳板链路（**`ssh_config` 里没有任何 ProxyJump**，需先造一条）· BSD `stat -f` 路径（无 BSD 主机，无法验）
+
+**C. 需要故障注入（可编排）**
+编辑进行中 kill Pi（无半写文件）· 连接中途断网 → 错误分类 · 任务运行中断网 → `unknown` 而非 failed · 两任务同时完成 → 不重复 · 两个 Pi 进程看同一任务 → 单观察者投递 · 异步传输中断 → `interrupted` 不续传 · 索引损坏的真实提示
+
+**D. 时间尺度**
+保留期清理（`retentionDays` 到期删远端 run 目录）· `outcome_unknown` 时 temp 是否残留
+
+**E. 验证资产的结构性缺口**
+仓库 22 个测试覆盖的是**旧子系统**（pool / proxyjump / resolve / shell / state / transfer / cleanup）；六项新功能**没有仓库测试**，其验证证据全在我写的临时探针（`C:/tmp/octssh-fp/*.cjs`，**未入库**）与真机记录里。探针不在仓库 → 无法复跑、无法回归。若要长期维护，应把关键探针（编辑编排结果语义、裁决回放、投递去重、项目身份）收成仓库测试。
