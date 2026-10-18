@@ -1,5 +1,6 @@
 import {
   CURSOR_MARKER,
+  matchesKey,
   truncateToWidth,
   visibleWidth,
   type Component,
@@ -141,19 +142,30 @@ export class SecretPrompt implements Component, Focusable {
     const pasteHandled = this.consumePaste(data);
     if (pasteHandled) return;
 
-    // 没有序列、但一次来了多个普通字符（部分终端/输入法如此）：全部追加。
-    if (data.length > 1 && this.isAllPrintable(data)) {
-      this.value += data;
+    // 先判「必须结束」的键：Escape / Ctrl+C 取消，Enter 提交。
+    // 用 pi-tui 的 matchesKey 而不是直接比字节：终端可能把 Escape 送来成
+    // CSI-u（`\x1b[27u`）等编码，只认 `\x1b` 会让 Esc 看起来「没反应」。
+    if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+      this.finish(undefined);
       return;
     }
 
-    if (data === "\r" || data === "\n") {
+    if (matchesKey(data, "return")) {
       this.finish(this.value);
       return;
     }
 
-    if (data === "\u001b") {
-      this.finish(undefined);
+    // 一次来了多个字符（部分终端/输入法会合并）。这里必须切开 CR/LF：
+    // 否则「粘贴/连打 + 回车」合成一个 chunk 时，回车会被当成密码的一部分
+    // 收进 value —— 用户按了正确的密码，服务端却收到带 \r 的字符串而拒绝。
+    if (data.length > 1 && this.isAllPrintable(data)) {
+      const breakAt = data.search(/[\r\n]/);
+      if (breakAt === -1) {
+        this.value += data;
+      } else {
+        this.value += data.slice(0, breakAt);
+        this.finish(this.value);
+      }
       return;
     }
 
@@ -165,7 +177,6 @@ export class SecretPrompt implements Component, Focusable {
     const printable = stripPrintable(data);
     if (printable !== undefined) this.value += printable;
   }
-
   private finish(value: string | undefined): void {
     if (this.finished) return;
     this.finished = true;
