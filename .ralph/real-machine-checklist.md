@@ -174,3 +174,14 @@ Host octssh-fixture
 2. **ssh2 `sftp.open` flags 用法错误**：传了 `{ flags: "w" }` 对象，真机报 `Unknown flags string: [object Object]`——**所有离线假适配器探针都绕过了真 ssh2**。修复 `sftpFileOps.writeFile` 与 `sftpWriteExclusive` 两处。
 
 **结论：真机验收价值被实证——两个缺陷全部只能在真机上暴露。** 剩余 blocked 项：密码登录类（无测试账户）、screen 任务类（fnos 无 screen）、真 Pi UI 交互类（面板/自动唤醒）。
+
+## 补充验收：nohup 后备后端（2026-10-18，fnos 无 screen，commit 83d0303）
+| 项 | 结果 | 证据 |
+|---|---|---|
+| 5.0 启动（无 screen） | ✅ | `backend=nohup screenName=null`，自动降级，不再报前置缺失 |
+| 5.1 运行中探活 | ✅ | `status=running cmdPid=3902380`（真 pid） |
+| 5.x 自然终态+退出码 | ✅ | `exit 7` → `failed/7`，tail=`nohup-alive\nnohup-done\n` |
+| 5.5 取消 | ✅ | cancel → `cancelled`；远端 meta 143 不再把 cancelled 降级为 failed |
+| 5.x stdin FIFO | ✅ | 写 11 字节成功，回读 `got:hello-fifo\n`，status=done |
+| 5.6 重启探活 | ✅ | 新 runtime 实例（模拟 Pi 重启）读旧记录探到 `running` |
+| 有 screen 主机回归 | ✅（代码路径） | 探测命中时走原 launcher，screen 分支语句未变 |
