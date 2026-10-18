@@ -187,6 +187,7 @@ octssh_edit({
 - **`outcome_unknown` 可能留下同目录临时文件**(`.octssh-*`):改名可能已生效,因此既不重试也不保证清理;请自行用 `octssh_read` 核对内容,必要时手动清理残留。
 - **`no_change` 不做远端确认**:当 `oldText === newText` 时工具在建连读文件之前就返回「无变更」,它不代表远端文件就是你以为的样子。
 - **密钥登录是纯配置行为**:私钥只从 `~/.ssh/config` 的 `IdentityFile` 读取,**一台主机只用其中第一把存在的私钥**;插件不弹密钥选择器,也不改配置。多把密钥时,请把该主机要用的那把写在前面的 `IdentityFile` 行。
+- **`~` 只展开 `~` 与 `~/...`**:`~otheruser/key` 这类写法会被当作「本地家目录下的 otheruser/key」,静默找不到密钥。请用 `~` 开头或绝对路径。
 - **不补默认密钥**:没有写 `IdentityFile` 的主机不会去试 `~/.ssh/id_ed25519`、`id_ecdsa`、`id_rsa`。想用密钥就在该 `Host` 下手写一行,否则走 agent 或密码认证。
 - **`IdentitiesOnly` 未解析**:该指令目前被忽略。由于每台主机只加载第一把显式指定的私钥,实际效果与 `IdentitiesOnly yes` 一致。
 - **ssh-agent 只在能确定地址时启用**:Unix 用 `SSH_AUTH_SOCK`;Windows 用 OpenSSH agent 的命名管道 `\\.\pipe\openssh-ssh-agent`(存在才用)。`SSH_AGENT_PID` 与 Git Bash 的虚拟 socket 路径不会被使用。
