@@ -65,7 +65,7 @@ export interface OctsshRuntime {
   listHosts(target?: string[]): Promise<unknown>;
   machineInfo(machine: string, refresh?: boolean, signal?: AbortSignal): Promise<unknown>;
   // projectId 由宿主从 ctx.cwd 算得后传入；模型无法提供，运行时也不接受来自工具参数的规则。
-  exec(params: { machine: string; command: string; sudo?: boolean; projectId?: string; signal?: AbortSignal; authorization?: Authorization }): Promise<ExecSuccess | NeedsConfirmation | BlockedResult>;
+  exec(params: { timeoutSeconds?: number; machine: string; command: string; sudo?: boolean; projectId?: string; signal?: AbortSignal; authorization?: Authorization }): Promise<ExecSuccess | NeedsConfirmation | BlockedResult>;
   execAsync(params: { machine: string; command: string; sudo?: boolean; projectId?: string; signal?: AbortSignal; authorization?: Authorization }): Promise<unknown>;
   upload(params: { machine: string; localPath: string; remotePath: string; projectId?: string; signal?: AbortSignal; authorization?: Authorization }): Promise<unknown>;
   download(params: { machine: string; remotePath: string; localPath: string; projectId?: string; signal?: AbortSignal; authorization?: Authorization }): Promise<unknown>;
@@ -91,10 +91,10 @@ export interface OctsshRuntime {
   dropConnections(): Promise<number>;
   readFile(params: { machine: string; path: string; offset?: number; limit?: number; projectId?: string; signal?: AbortSignal; authorization?: Authorization }): Promise<ReadRemoteFileResult | BlockedResult | NeedsConfirmation>;
   editFile(params: { machine: string; path: string; expectedVersion: string; oldText: string; newText: string; dryRun?: boolean; projectId?: string; signal?: AbortSignal; authorization?: Authorization }): Promise<ApplyEditResult | NeedsConfirmation | BlockedResult>;
-  getSession(sessionId: string, lines?: number, projectId?: string): Promise<unknown>;
-  grepSession(sessionId: string, pattern: string, options?: { maxMatches?: number; contextLines?: number }, projectId?: string): Promise<unknown>;
-  writeStdin(sessionId: string, data: string, options?: { appendNewline?: boolean }, projectId?: string, authorization?: Authorization): Promise<unknown>;
-  cancelSession(sessionId: string, signal?: string, projectId?: string, authorization?: Authorization): Promise<unknown>;
+  getSession(sessionId: string, lines?: number, projectId?: string, abortSignal?: AbortSignal): Promise<unknown>;
+  grepSession(sessionId: string, pattern: string, options?: { maxMatches?: number; contextLines?: number }, projectId?: string, abortSignal?: AbortSignal): Promise<unknown>;
+  writeStdin(sessionId: string, data: string, options?: { appendNewline?: boolean }, projectId?: string, authorization?: Authorization, abortSignal?: AbortSignal): Promise<unknown>;
+  cancelSession(sessionId: string, signal?: string, projectId?: string, authorization?: Authorization, abortSignal?: AbortSignal): Promise<unknown>;
 }
 
 /** lstat 适配：把 ssh2 attrs 收窄成编排需要的形状。 */
@@ -158,8 +158,6 @@ function mapSessionStatus(status: string): TaskState {
 
 const isoNow = () => new Date().toISOString();
 
-/** 超过这个数量的文件不提供「始终允许」：范围不可完整展示即不可永久授权。 */
-const MAX_PERMANENT_SCOPE = 10;
 type TransferSession = Extract<SessionRecord, { kind: "transfer" }>;
 type LocalSession = Extract<SessionRecord, { kind: "local" }>;
 function isTransferSession(rec: SessionRecord): rec is TransferSession { return "kind" in rec && rec.kind === "transfer"; }
@@ -178,11 +176,13 @@ function digest(operation: string, payload: unknown) {
 }
 async function detectRemotePlatform(client: Client, signal?: AbortSignal): Promise<RemotePlatform> {
   try {
-    const result = await runCommand(client, "uname -s 2>/dev/null || ver", { maxStdoutBytes: 1024, maxStderrBytes: 1024, signal });
+    const result = await runCommand(client, "uname -s 2>/dev/null || ver", { maxStdoutBytes: 1024, maxStderrBytes: 1024, timeoutMs: 10_000, signal });
     const text = `${result.stdout}\n${result.stderr}`.toLowerCase();
     if (text.includes("windows") || text.includes("microsoft")) return "windows";
     if (result.exitCode === 0 && text.trim()) return "posix";
-  } catch { /* unknown */ }
+  } catch (error) {
+    if (error instanceof Error && ["AbortError", "TimeoutError", "ConnectionError"].includes(error.name)) throw error;
+  }
   return "unknown";
 }
 
@@ -202,6 +202,9 @@ class Runtime implements OctsshRuntime {
   private readonly pool: ConnectionPool<string, MachineConnection>;
   private sweepTimer?: NodeJS.Timeout;
   private cleanupTimer?: NodeJS.Timeout;
+  private taskSweep?: Promise<SweepSummary & { storeCorruptReported: boolean; deliveredPruned: number }>;
+  private taskSweepProject?: string;
+  private taskSweepAbort?: AbortController;
   private started = false;
   private shuttingDown = false;
   private generation = 0;
@@ -254,15 +257,19 @@ class Runtime implements OctsshRuntime {
               signal,
             })
           : await connectDirect({ ...plan.target, signal, hostVerifier, auth: authTarget });
-        const platform = await detectRemotePlatform(ssh.client, signal);
-        const connection: MachineConnection = { ssh, warnings: plan.warnings, platform };
-        // connectSsh2 keeps an error listener to prevent ssh2 EventEmitter
-        // crashes. Pooling must additionally discard that client: otherwise a
-        // disconnected socket remains reusable until its idle TTL expires.
-        const invalidate = () => { void this.pool.invalidate(machine, connection).catch(() => undefined); };
-        ssh.client.on("error", invalidate);
-        ssh.client.on("close", invalidate);
-        return connection;
+        try {
+          const platform = await detectRemotePlatform(ssh.client, signal);
+          signal?.throwIfAborted();
+          const connection: MachineConnection = { ssh, warnings: plan.warnings, platform };
+          const invalidate = () => { void this.pool.invalidate(machine, connection).catch(() => undefined); };
+          ssh.client.on("error", invalidate);
+          ssh.client.on("close", invalidate);
+          return connection;
+        } catch (error) {
+          // 握手已完成、探测未完成时也必须释放连接，池尚未接管它。
+          ssh.end();
+          throw error;
+        }
       },
       close: (value) => value.ssh.end(),
       options: { maxConnections: this.cfg.maxConnections, idleTtlMs: this.cfg.idleTtlSeconds * 1000 },
@@ -285,6 +292,7 @@ class Runtime implements OctsshRuntime {
     this.shuttingDown = true;
     this.started = false;
     this.generation += 1;
+    this.taskSweepAbort?.abort();
     if (this.sweepTimer) clearInterval(this.sweepTimer);
     if (this.cleanupTimer) clearInterval(this.cleanupTimer);
     this.sweepTimer = undefined;
@@ -320,7 +328,7 @@ class Runtime implements OctsshRuntime {
     if (!refresh) return inv?.machines.find((m) => m.name === machine) ?? { error: "No cached info. Refresh this machine first." };
     const lease = await this.pool.get(machine, signal);
     try {
-      const info = await collectExtendedInfo(lease.value.ssh.client);
+      const info = await collectExtendedInfo(lease.value.ssh.client, signal);
       const updated = { name: machine, updatedAt: isoNow(), ...info };
       const existing = inv ?? { extended: true, machines: [] };
       saveInventory({ extended: true, machines: [...existing.machines.filter((m) => m.name !== machine), updated] }, getOctsshDir());
@@ -328,8 +336,11 @@ class Runtime implements OctsshRuntime {
     } finally { lease.release(); }
   }
 
-  async exec(params: { machine: string; command: string; sudo?: boolean; projectId?: string; signal?: AbortSignal; authorization?: Authorization }) {
+  async exec(params: { timeoutSeconds?: number; machine: string; command: string; sudo?: boolean; projectId?: string; signal?: AbortSignal; authorization?: Authorization }) {
     this.ensureActive();
+    if (params.timeoutSeconds !== undefined && (!Number.isInteger(params.timeoutSeconds) || params.timeoutSeconds < 1 || params.timeoutSeconds > 3600)) {
+      throw new RangeError("timeoutSeconds must be an integer between 1 and 3600");
+    }
     // 规则 deny 在建立连接之前判定：被禁止的操作不该先握手再报错。
     const identity = resolveIdentity(params.machine);
     const scope: OperationScope = {
@@ -356,7 +367,7 @@ class Runtime implements OctsshRuntime {
           : this.denyResult(post);
       }
 
-      const needsConfirm = guard.action === "needs_confirmation" || post.decision === "ask";
+      const needsConfirm = guard.action === "needs_confirmation" || (post.decision === "ask" && post.reason !== "no_rule" && post.reason !== "no_project");
       // authorized=true 表示调用方已为本次 payload 消费过一次性授权：
       // ask 再拦一次会形成「确认→重试→仍 ask」的无限确认循环。
       if (needsConfirm && post.decision !== "allow" && !authorized) {
@@ -365,7 +376,7 @@ class Runtime implements OctsshRuntime {
         return this.requestAuthorization("exec", payload, message, preview, scope);
       }
 
-      const result = await runCommand(lease.value.ssh.client, params.sudo ? wrapSudoSh(params.command) : wrapSh(params.command), { signal: params.signal });
+      const result = await runCommand(lease.value.ssh.client, params.sudo ? wrapSudoSh(params.command) : wrapSh(params.command), { signal: params.signal, timeoutMs: (params.timeoutSeconds ?? 60) * 1000 });
       return { kind: "success", machine: params.machine, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr, truncated: result.truncated, warnings: lease.value.warnings, sudoHint: params.sudo && result.exitCode !== 0 && isSudoPasswordError(result.stderr) ? "Passwordless sudo is required." : null } as ExecSuccess;
     } finally { lease.release(); }
   }
@@ -396,14 +407,14 @@ class Runtime implements OctsshRuntime {
           : this.denyResult(post);
       }
 
-      const needsConfirm = guard.action === "needs_confirmation" || post.decision === "ask";
+      const needsConfirm = guard.action === "needs_confirmation" || (post.decision === "ask" && post.reason !== "no_rule" && post.reason !== "no_project");
       if (needsConfirm && post.decision !== "allow" && !authorized) {
         const preview = guard.action === "needs_confirmation" ? guard.preview : this.askPreview(post.rule ? `Matched project rule ${post.rule.id} (ask).` : "No project rule matched; confirmation required.");
         const message = guard.action === "needs_confirmation" ? guard.message : "该操作需要确认。";
         return this.requestAuthorization("exec", payload, message, preview, scope);
       }
 
-      return { kind: "success", ...(await startAsyncInScreen(lease.value.ssh.client, { machine: params.machine, command: params.command, sudo: !!params.sudo })) };
+      return { kind: "success", ...(await startAsyncInScreen(lease.value.ssh.client, { machine: params.machine, command: params.command, sudo: !!params.sudo, signal: params.signal })) };
     } finally { lease.release(); }
   }
 
@@ -414,31 +425,27 @@ class Runtime implements OctsshRuntime {
     const pre = this.decide(params.projectId, fileRequest({ operation: "upload", identity, remotePath: params.remotePath }));
     if (pre.decision === "deny") return this.denyResult(pre);
 
-    // 项目规则 ask 在建立连接之前就问：这是策略层结论，不需要先握手。
-    // 与「覆盖冲突」用不同 payload，两者是独立的确认理由，各自一次性有效。
-    const askPayload = { machine: params.machine, localPath: params.localPath, remotePath: params.remotePath, reason: "project-ask" };
-    if (pre.decision === "ask" && !this.consume(params.authorization, "upload", askPayload)) {
-      return this.requestAuthorization(
-        "upload", askPayload, "This upload needs confirmation (project rule).",
-        this.askPreview(pre.rule ? `Matched project rule ${pre.rule.id} (ask).` : "No project rule matched."),
-        { ...scope, operation: "upload" },
-        false,
-      );
-    }
+    // 项目 ask 与覆盖清单合为一次确认，避免一次性 token 在两道检查间循环。
 
     const lease = await this.pool.get(params.machine, params.signal);
     try {
       const plan = await planUpload(lease.value.ssh.client, params.localPath, params.remotePath, params.signal);
       const conflicts = await findUploadConflicts(lease.value.ssh.client, plan, params.signal);
-      const payload = { machine: params.machine, localPath: params.localPath, remotePath: params.remotePath, conflicts };
-      if (conflicts.length && !this.consume(params.authorization, "upload", payload)) {
-        // 涉及文件过多时不给「始终允许」：拿不到完整范围就不能授权整个目录。
-        const allowPermanent = conflicts.length <= MAX_PERMANENT_SCOPE && !scope.path?.subtree;
+      const targets = plan.files.map((file) => this.decide(params.projectId, fileRequest({ operation: "upload", identity, remotePath: file.remote })));
+      const denied = targets.find((decision) => decision.decision === "deny");
+      if (denied) return this.denyResult(denied);
+      const requiresAsk = (pre.decision === "ask" && pre.reason !== "no_rule" && pre.reason !== "no_project") || targets.some((decision) => decision.decision === "ask");
+      const overwriteAllowed = (pre.decision !== "ask" || pre.reason === "no_rule" || pre.reason === "no_project") && targets.every((decision) => decision.decision === "allow");
+      const permanentScope: OperationScope = { ...scope, path: { value: plan.files[0]?.remote ?? params.remotePath, subtree: false } };
+      const payload = { projectId: params.projectId, machine: params.machine, localPath: params.localPath, remotePath: params.remotePath, conflicts, async: false };
+      if ((requiresAsk || (conflicts.length > 0 && !overwriteAllowed)) && !this.consume(params.authorization, "upload", payload)) {
         return this.requestAuthorization(
-          "upload", payload, "Upload would overwrite existing remote files.",
-          { type: "upload-conflicts", total: conflicts.length, truncated: conflicts.length > 10, sample: conflicts.slice(0, 10) },
-          { ...scope, operation: "upload" },
-          allowPermanent,
+          "upload", payload, conflicts.length ? "上传将覆盖现有文件。" : "项目要求确认此次上传。",
+          conflicts.length
+            ? { type: "upload-conflicts", total: conflicts.length, truncated: conflicts.length > 10, sample: conflicts.slice(0, 10) }
+            : this.askPreview(pre.rule ? `项目规则：${pre.rule.id}` : "未匹配项目规则。"),
+          permanentScope,
+          !plan.isDir && plan.files.length === 1,
         );
       }
       return { kind: "success", machine: params.machine, ...(await performUpload(lease.value.ssh.client, plan, params.signal)) };
@@ -478,29 +485,28 @@ class Runtime implements OctsshRuntime {
     const pre = this.decide(params.projectId, fileRequest({ operation: "upload-async", identity, remotePath: params.remotePath }));
     if (pre.decision === "deny") return this.denyResult(pre);
 
-    const askPayload = { machine: params.machine, localPath: params.localPath, remotePath: params.remotePath, reason: "project-ask", async: true };
-    if (pre.decision === "ask" && !this.consume(params.authorization, "upload", askPayload)) {
-      return this.requestAuthorization(
-        "upload", askPayload, "This async upload needs confirmation (project rule).",
-        this.askPreview(pre.rule ? `Matched project rule ${pre.rule.id} (ask).` : "No project rule matched."),
-        scope,
-        false,
-      );
-    }
+    // 项目 ask 与覆盖清单合为一次确认，避免一次性 token 在两道检查间循环。
 
     const lease = await this.pool.get(params.machine, params.signal);
     let handedOff = false;
     try {
       const plan = await planUpload(lease.value.ssh.client, params.localPath, params.remotePath, params.signal);
       const conflicts = await findUploadConflicts(lease.value.ssh.client, plan, params.signal);
-      const payload = { machine: params.machine, localPath: params.localPath, remotePath: params.remotePath, conflicts, async: true };
-      if (conflicts.length && !this.consume(params.authorization, "upload", payload)) {
-        const allowPermanent = conflicts.length <= MAX_PERMANENT_SCOPE && !scope.path?.subtree;
+      const targets = plan.files.map((file) => this.decide(params.projectId, fileRequest({ operation: "upload", identity, remotePath: file.remote })));
+      const denied = targets.find((decision) => decision.decision === "deny");
+      if (denied) return this.denyResult(denied);
+      const requiresAsk = (pre.decision === "ask" && pre.reason !== "no_rule" && pre.reason !== "no_project") || targets.some((decision) => decision.decision === "ask");
+      const overwriteAllowed = (pre.decision !== "ask" || pre.reason === "no_rule" || pre.reason === "no_project") && targets.every((decision) => decision.decision === "allow");
+      const permanentScope: OperationScope = { ...scope, path: { value: plan.files[0]?.remote ?? params.remotePath, subtree: false } };
+      const payload = { projectId: params.projectId, machine: params.machine, localPath: params.localPath, remotePath: params.remotePath, conflicts, async: true };
+      if ((requiresAsk || (conflicts.length > 0 && !overwriteAllowed)) && !this.consume(params.authorization, "upload", payload)) {
         return this.requestAuthorization(
-          "upload", payload, "Async upload would overwrite existing remote files.",
-          { type: "upload-conflicts", total: conflicts.length, truncated: conflicts.length > 10, sample: conflicts.slice(0, 10) },
-          scope,
-          allowPermanent,
+          "upload", payload, conflicts.length ? "上传将覆盖现有文件。" : "项目要求确认此次上传。",
+          conflicts.length
+            ? { type: "upload-conflicts", total: conflicts.length, truncated: conflicts.length > 10, sample: conflicts.slice(0, 10) }
+            : this.askPreview(pre.rule ? `项目规则：${pre.rule.id}` : "未匹配项目规则。"),
+          permanentScope,
+          !plan.isDir && plan.files.length === 1,
         );
       }
       handedOff = true;
@@ -552,7 +558,7 @@ class Runtime implements OctsshRuntime {
     // 契约要求：命中项目 ask 时即使本来不需确认也要问一次。读虽无副作用，
     // 但规则写了 ask 就是用户的明确意图（例如只允许人工查看敏感文件）。
     const askPayload = { machine: params.machine, path: params.path, reason: "project-ask" };
-    if (pre.decision === "ask" && !this.consume(params.authorization, "read", askPayload)) {
+    if (pre.decision === "ask" && pre.reason !== "no_rule" && pre.reason !== "no_project" && !this.consume(params.authorization, "read", askPayload)) {
       return this.requestAuthorization(
         "read", askPayload, "Reading this file needs confirmation (project rule).",
         this.askPreview(pre.rule ? `Matched project rule ${pre.rule.id} (ask).` : "No project rule matched."),
@@ -573,6 +579,7 @@ class Runtime implements OctsshRuntime {
           offset: params.offset,
           limit: params.limit,
         }),
+        params.signal,
       );
     } finally {
       lease.release();
@@ -628,7 +635,7 @@ class Runtime implements OctsshRuntime {
           newText: params.newText,
           dryRun: params.dryRun,
         });
-      });
+      }, params.signal);
     } finally {
       lease.release();
     }
@@ -699,17 +706,18 @@ class Runtime implements OctsshRuntime {
     return parsed.reason === "template_not_applicable" ? "template_not_applicable" : null;
   }
 
-  async getSession(sessionId: string, lines?: number, projectId?: string) {
+  async getSession(sessionId: string, lines?: number, projectId?: string, abortSignal?: AbortSignal) {
     this.ensureActive();
+    abortSignal?.throwIfAborted();
     const rec = loadSession(sessionId, getOctsshDir());
     if (!rec) return { kind: "error", error: "session not found" };
     const denied = this.sessionDenied(projectId, "session-get", rec.machine);
     if (denied) return denied;
     if (isTransferSession(rec)) return { ...rec, resultKind: "success", tails: lines && rec.localLogPath ? { log: tailLocalFile(rec.localLogPath, Math.min(2000, Math.max(1, lines))) } : null };
     if (isLocalSession(rec)) return { kind: "error", error: "legacy local sessions are not supported" };
-    const lease = await this.pool.get(rec.machine);
+    const lease = await this.pool.get(rec.machine, abortSignal);
     try {
-      const meta = await runCommand(lease.value.ssh.client, wrapSh(`test -f "${toHomeAbs(rec.metaPath)}" && cat "${toHomeAbs(rec.metaPath)}" || true`), { maxStdoutBytes: 16 * 1024, maxStderrBytes: 4096 });
+      const meta = await runCommand(lease.value.ssh.client, wrapSh(`test -f "${toHomeAbs(rec.metaPath)}" && cat "${toHomeAbs(rec.metaPath)}" || true`), { signal: abortSignal, timeoutMs: 15_000, maxStdoutBytes: 16 * 1024, maxStderrBytes: 4096 });
       let remoteMeta: any = null; try { remoteMeta = meta.stdout.trim() ? JSON.parse(meta.stdout) : null; } catch { /* ignore */ }
       let status = rec.status; let exitCode = rec.exitCode ?? null;
       if (remoteMeta?.status === "running") status = "running";
@@ -728,8 +736,8 @@ class Runtime implements OctsshRuntime {
       let tails: any = null;
       if (lines) {
         const n = Math.min(2000, Math.max(1, Math.floor(lines)));
-        const out = await runCommand(lease.value.ssh.client, wrapSh(`tail -n ${n} "${toHomeAbs(rec.stdoutPath)}" 2>/dev/null || true`));
-        const err = await runCommand(lease.value.ssh.client, wrapSh(`tail -n ${n} "${toHomeAbs(rec.stderrPath)}" 2>/dev/null || true`));
+        const out = await runCommand(lease.value.ssh.client, wrapSh(`tail -n ${n} "${toHomeAbs(rec.stdoutPath)}" 2>/dev/null || true`), { signal: abortSignal, timeoutMs: 15_000 });
+        const err = await runCommand(lease.value.ssh.client, wrapSh(`tail -n ${n} "${toHomeAbs(rec.stderrPath)}" 2>/dev/null || true`), { signal: abortSignal, timeoutMs: 15_000 });
         tails = { stdout: out.stdout, stderr: err.stdout };
       }
       const backend = rec.backend ?? "screen";
@@ -737,24 +745,26 @@ class Runtime implements OctsshRuntime {
     } finally { lease.release(); }
   }
 
-  async grepSession(sessionId: string, pattern: string, options: { maxMatches?: number; contextLines?: number } = {}, projectId?: string) {
+  async grepSession(sessionId: string, pattern: string, options: { maxMatches?: number; contextLines?: number } = {}, projectId?: string, abortSignal?: AbortSignal) {
     this.ensureActive();
+    abortSignal?.throwIfAborted();
     const rec = loadSession(sessionId, getOctsshDir());
     if (!rec || isTransferSession(rec) || isLocalSession(rec)) return { kind: "error", error: "remote session not found" };
     const denied = this.sessionDenied(projectId, "session-grep", rec.machine);
     if (denied) return denied;
-    const lease = await this.pool.get(rec.machine);
+    const lease = await this.pool.get(rec.machine, abortSignal);
     try {
       const m = Math.min(500, Math.max(1, options.maxMatches ?? 50)); const c = Math.min(50, Math.max(0, options.contextLines ?? 2));
       const grep = (file: string) => wrapSh(`command -v grep >/dev/null 2>&1 && grep -n -E -m ${m} -C ${c} -e ${quoteForSh(pattern)} "${toHomeAbs(file)}" 2>/dev/null || true`);
-      const stdout = await runCommand(lease.value.ssh.client, grep(rec.stdoutPath));
-      const stderr = await runCommand(lease.value.ssh.client, grep(rec.stderrPath));
+      const stdout = await runCommand(lease.value.ssh.client, grep(rec.stdoutPath), { signal: abortSignal, timeoutMs: 15_000 });
+      const stderr = await runCommand(lease.value.ssh.client, grep(rec.stderrPath), { signal: abortSignal, timeoutMs: 15_000 });
       return { kind: "success", session_id: sessionId, pattern, matches: { stdout: stdout.stdout, stderr: stderr.stdout } };
     } finally { lease.release(); }
   }
 
-  async writeStdin(sessionId: string, data: string, options: { appendNewline?: boolean } = {}, projectId?: string, authorization?: Authorization) {
+  async writeStdin(sessionId: string, data: string, options: { appendNewline?: boolean } = {}, projectId?: string, authorization?: Authorization, abortSignal?: AbortSignal) {
     this.ensureActive();
+    abortSignal?.throwIfAborted();
     const rec = loadSession(sessionId, getOctsshDir());
     if (!rec || isTransferSession(rec) || isLocalSession(rec) || !rec.stdinPath || !rec.stdinLogPath) return { kind: "error", error: "stdin is not available for this session" };
     const denied = this.sessionDenied(projectId, "session-write-stdin", rec.machine);
@@ -772,18 +782,19 @@ class Runtime implements OctsshRuntime {
     if (rec.status !== "running") return { kind: "error", error: "session is not running" };
     const payload = Buffer.from(options.appendNewline === false ? data : `${data}\n`, "utf8");
     if (payload.byteLength > 64 * 1024) return { kind: "error", error: "payload too large (max 64KiB)" };
-    const lease = await this.pool.get(rec.machine);
+    const lease = await this.pool.get(rec.machine, abortSignal);
     try {
       const encoded = payload.toString("base64");
       const command = [`command -v base64 >/dev/null 2>&1 || exit 1`, `stdin="${toHomeAbs(rec.stdinPath)}"`, `stdinlog="${toHomeAbs(rec.stdinLogPath)}"`, `test -p "$stdin" || exit 1`, `printf %s ${quoteForSh(encoded)} | base64 -d | tee -a "$stdinlog" > "$stdin"`].join("; ");
-      const result = await runCommand(lease.value.ssh.client, wrapSh(command), { maxStdoutBytes: 8192, maxStderrBytes: 8192 });
+      const result = await runCommand(lease.value.ssh.client, wrapSh(command), { signal: abortSignal, timeoutMs: 15_000, maxStdoutBytes: 8192, maxStderrBytes: 8192 });
       if (result.exitCode !== 0) return { kind: "error", error: result.stderr || "failed to write stdin" };
       return { kind: "success", session_id: sessionId, bytes: payload.byteLength };
     } finally { lease.release(); }
   }
 
-  async cancelSession(sessionId: string, signal?: string, projectId?: string, authorization?: Authorization) {
+  async cancelSession(sessionId: string, signal?: string, projectId?: string, authorization?: Authorization, abortSignal?: AbortSignal) {
     this.ensureActive();
+    abortSignal?.throwIfAborted();
     const rec = loadSession(sessionId, getOctsshDir());
     if (!rec) return { kind: "error", error: "session not found" };
     const denied = this.sessionDenied(projectId, "session-cancel", rec.machine);
@@ -805,13 +816,13 @@ class Runtime implements OctsshRuntime {
     }
     if (isLocalSession(rec)) return { kind: "error", error: "legacy local sessions are not supported" };
     if (rec.status !== "running") return { kind: "success", session_id: sessionId, status: rec.status };
-    const lease = await this.pool.get(rec.machine);
+    const lease = await this.pool.get(rec.machine, abortSignal);
     try {
       const sig = /^[A-Z0-9]+$/.test((signal ?? "TERM").toUpperCase()) ? (signal ?? "TERM").toUpperCase() : "TERM";
       const parts = rec.cmdPid ? [`kill -s ${sig} ${rec.cmdPid} 2>/dev/null || true`] : [];
       // screen 后端才退出 screen 会话；nohup 后端 kill cmdPid 后 wrapper 会自然写 done meta。
       if ((rec.backend ?? "screen") === "screen" && rec.screenName) parts.push(`screen -S ${quoteForSh(rec.screenName)} -X quit 2>/dev/null || true`);
-      await runCommand(lease.value.ssh.client, wrapSh(parts.join("; ")));
+      await runCommand(lease.value.ssh.client, wrapSh(parts.join("; ")), { signal: abortSignal, timeoutMs: 15_000 });
       saveSession({ ...rec, status: "cancelled", updatedAt: isoNow() }, getOctsshDir());
       return { kind: "success", session_id: sessionId, status: "cancelled", signal: sig };
     } finally { lease.release(); }
@@ -892,7 +903,7 @@ class Runtime implements OctsshRuntime {
   }
 
   /** 观测单个任务。任何失败都归为 unknown——观测不到不等于任务失败。 */
-  private async observeTask(record: TaskRecord): Promise<TaskObservation> {
+  private async observeTask(record: TaskRecord, signal?: AbortSignal): Promise<TaskObservation> {
     try {
       const rec = loadSession(record.taskId, getOctsshDir());
       if (!rec) {
@@ -909,7 +920,7 @@ class Runtime implements OctsshRuntime {
             : {}),
         };
       }
-      const info = (await this.getSession(record.taskId)) as Record<string, unknown>;
+      const info = (await this.getSession(record.taskId, undefined, undefined, signal)) as Record<string, unknown>;
       if (info && info.kind === "error") {
         return { observation: "unknown", reason: String(info.error ?? "session unreadable") };
       }
@@ -927,15 +938,45 @@ class Runtime implements OctsshRuntime {
   }
 
   /** 跑一轮扫描。 */
-  async sweepTasks(params: { projectId?: string; hasSessionForProject?: (projectId: string) => boolean } = {}): Promise<SweepSummary & { storeCorruptReported: boolean; deliveredPruned: number }> {
+  sweepTasks(params: { projectId?: string; hasSessionForProject?: (projectId: string) => boolean } = {}): Promise<SweepSummary & { storeCorruptReported: boolean; deliveredPruned: number }> {
     this.ensureActive();
+    if (this.taskSweep) {
+      if (this.taskSweepProject !== params.projectId) return Promise.reject(new Error("任务扫描忙，请稍后重试。"));
+      return this.taskSweep;
+    }
+    const controller = new AbortController();
+    this.taskSweepAbort = controller;
+    this.taskSweepProject = params.projectId;
+    const sweep = this.performTaskSweep(params, controller.signal);
+    this.taskSweep = sweep;
+    void sweep.finally(() => {
+      if (this.taskSweep === sweep) {
+        this.taskSweep = undefined;
+        this.taskSweepProject = undefined;
+        this.taskSweepAbort = undefined;
+      }
+    }).catch(() => undefined);
+    return sweep;
+  }
+
+  private async performTaskSweep(params: { projectId?: string; hasSessionForProject?: (projectId: string) => boolean }, signal: AbortSignal) {
     this.syncTaskRecords(params.projectId);
     const summary = await runTaskSweep({
       store: this.taskStore,
       delivery: this.taskDelivery,
-      observe: (record) => this.observeTask(record),
+      signal,
+      observe: async (record) => {
+        const deadline = new AbortController();
+        const timer = setTimeout(() => deadline.abort(new Error("任务观测超时")), 15_000);
+        try {
+          return await this.observeTask(record, AbortSignal.any([signal, deadline.signal]));
+        } finally {
+          clearTimeout(timer);
+        }
+      },
       hasSessionForProject: params.hasSessionForProject,
     });
+    signal.throwIfAborted();
     const firstReport = summary.storeCorrupt && !this.taskStoreCorruptReported;
     if (summary.storeCorrupt) this.taskStoreCorruptReported = true;
 

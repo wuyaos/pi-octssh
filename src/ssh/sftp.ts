@@ -2,20 +2,55 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import { pipeline } from "node:stream/promises";
 import type { Client } from "ssh2";
+import { scopeSftp } from "./sftpScope.ts";
 
 export type SftpClient = any;
 
-export function getSftp(client: Client): Promise<SftpClient> {
+export function getSftp(client: Client, signal?: AbortSignal, timeoutMs = 15_000): Promise<SftpClient> {
+  signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
-    client.sftp((err: any, sftp: any) => {
-      if (err) reject(err);
-      else resolve(sftp);
-    });
+    let settled = false;
+    const closeLate = (sftp: SftpClient) => {
+      sftp.on?.("error", () => {});
+      try { sftp.end?.(); } catch { /* 已关闭 */ }
+      try { sftp.destroy?.(); } catch { /* 已关闭 */ }
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      client.removeListener?.("close", onClose);
+      client.removeListener?.("error", fail);
+    };
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const onAbort = () => fail(signal?.reason ?? new Error("SFTP 已取消"));
+    const onClose = () => fail(new Error("SSH 连接中断"));
+    const timer = setTimeout(() => {
+      const error = new Error("SFTP 通道打开超时");
+      error.name = "TimeoutError";
+      fail(error);
+    }, timeoutMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    client.on?.("close", onClose);
+    client.on?.("error", fail);
+    try {
+      client.sftp((err: any, sftp: any) => {
+        if (settled) { if (sftp) closeLate(sftp); return; }
+        if (err) { fail(err); return; }
+        settled = true;
+        cleanup();
+        resolve(scopeSftp(sftp, signal));
+      });
+    } catch (error) { fail(error as Error); }
   });
 }
 
-export async function withSftp<T>(client: Client, fn: (sftp: SftpClient) => Promise<T>) {
-  const sftp = await getSftp(client);
+export async function withSftp<T>(client: Client, fn: (sftp: SftpClient) => Promise<T>, signal?: AbortSignal) {
+  const sftp = await getSftp(client, signal);
   try {
     return await fn(sftp);
   } finally {

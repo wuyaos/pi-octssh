@@ -13,6 +13,10 @@ import {
 } from "../src/index.ts";
 import type { HostKeyConfirm } from "../src/ssh/hostVerifier.ts";
 import { projectDisplayPath, projectIdFromCwd } from "../src/security/project.ts";
+import { SessionApproval } from "../src/security/sessionApproval.ts";
+import { resolveIdentity } from "../src/ssh/machine.ts";
+import { displayIdentity } from "../src/security/identity.ts";
+import { subcommandScope } from "../src/security/commandShape.ts";
 import { addRule, removeRule, listRules } from "../src/security/rules.ts";
 import { describeScope, scopeRule, type OperationScope } from "../src/security/authorize.ts";
 import { SecretPrompt } from "../src/tui/secretPrompt.ts";
@@ -46,6 +50,8 @@ type ConfirmationResult = {
   authorizationRequest: AuthorizationRequest;
 };
 
+const sessionApproval = new SessionApproval();
+let approvalGeneration = 0;
 let runtime: OctsshRuntime | null = null;
 let runtimeStartedAt: number | null = null;
 let lastRuntimeError: string | null = null;
@@ -208,16 +214,19 @@ function startSweepTimer() {
   sweepTimer.unref?.();
 }
 
+const sweepingRuntimes = new WeakSet<OctsshRuntime>();
 async function runSweepOnce(): Promise<void> {
   const rt = runtime;
   const ctx = notifyContext;
-  if (!rt || !ctx) return;
-  const pid = projectId(ctx);
+  if (!rt || !ctx || sweepingRuntimes.has(rt)) return;
+  sweepingRuntimes.add(rt);
   try {
+    const pid = projectId(ctx);
     const summary = await rt.sweepTasks({
       projectId: pid,
       hasSessionForProject: (want) => want === pid,
     });
+    if (runtime !== rt || notifyContext !== ctx) return;
     if (summary.storeCorruptReported) {
       // 只提示一次：反复扫描不应该反复打扰。
       ctx.ui.notify(
@@ -230,6 +239,8 @@ async function runSweepOnce(): Promise<void> {
     }
   } catch {
     // 扫描失败留给下一轮；不向上抛，避免打断用户。
+  } finally {
+    sweepingRuntimes.delete(rt);
   }
 }
 
@@ -332,7 +343,9 @@ function finishEdit(operation: string, result: unknown): ToolResult {
     case "unsupported":
       return makeResult(operation, result, `无法安全编辑：${String(record?.reason)}`, "blocked");
     case "not_written":
-      return makeResult(operation, result, "写入未发生：临时文件已清理，目标文件未被改动。", "blocked");
+      return makeResult(operation, result, record?.tempRemoved
+        ? "目标未改动，临时文件已清理。"
+        : "目标未改动；临时文件可能残留。", "blocked");
     case "blocked":
       return makeResult(operation, result, `已阻止：${String(record?.detail ?? "")}`, "blocked");
     case "outcome_unknown":
@@ -364,15 +377,15 @@ function confirmationMessage(request: AuthorizationRequest): string {
   if (preview.sample.length > 0) {
     lines.push("", "预览:", ...preview.sample.slice(0, 10).map((item) => `• ${item}`));
   }
-  lines.push("", "仅在确认内容无误时继续。此授权只对本次操作有效。");
+  lines.push("", "永久规则仅用于当前项目与此主机。");
   return lines.join("\n");
 }
 
 const CONFIRM_CHOICES = {
-  once: "仅本次允许",
-  always: "此项目始终允许",
-  never: "此项目始终禁止",
-  reject: "本次拒绝",
+  once: "允许一次",
+  always: "永久允许",
+  never: "永久禁止",
+  reject: "拒绝",
 } as const;
 
 /**
@@ -386,12 +399,19 @@ async function withConfirmation(
   ctx: ExtensionContext,
   projectId: string | undefined,
   run: (authorization?: Authorization) => Promise<unknown>,
+  signal?: AbortSignal,
 ): Promise<ToolResult | unknown> {
+  signal?.throwIfAborted();
   let result = await run();
 
   // 上传冲突可能在用户确认期间发生变化；若 Core 重新要求确认，展示新预览。
   for (let attempt = 0; isConfirmation(result) && attempt < 3; attempt += 1) {
     const request = result.authorizationRequest;
+    if (request.scope && sessionApproval.allows(projectId, request.scope.identity)) {
+      signal?.throwIfAborted();
+      result = await run(getRuntime().authorize(request));
+      continue;
+    }
     if (!ctx.hasUI || ctx.mode !== "tui") {
       return makeResult(
         operation,
@@ -423,13 +443,13 @@ async function withConfirmation(
     if (scope?.command) {
       body.push(
         "",
-        "注意：「始终允许 / 始终禁止」保存的是这行命令的完整原文（含空格、引号与参数顺序），",
-        "改写写法（多加一个参数、换引号、尾随空格、加路径斜杠）不会命中该规则，仍需再次确认。",
+        "默认只记住完整命令；选择永久允许后，可为支持的命令改选子命令范围。",
       );
     }
 
     // select 只接受标题 + 选项，没有正文参数，因此范围说明并入标题。
-    const choice = await ctx.ui.select([`${operation} — OctSSH 安全确认`, "", ...body].join("\n"), options);
+    const choice = await ctx.ui.select([`${operation} — OctSSH 安全确认`, "", ...body].join("\n"), options, { signal });
+    signal?.throwIfAborted();
 
     if (choice === CONFIRM_CHOICES.never) {
       if (projectId && scope) {
@@ -466,7 +486,17 @@ async function withConfirmation(
         );
       }
       try {
-        addRule(projectId, scopeRule(scope, "allow", `allowed at ${new Date().toISOString()}`));
+        let savedScope = scope;
+        const subcommand = scope.command && subcommandScope(scope.command.value);
+        if (subcommand && scope.command) {
+          const exact = "仅此完整命令";
+          const family = `${subcommand} *（参数可变）`;
+          const selected = await ctx.ui.select("永久允许 · 当前项目\n子命令授权包含该动作的所有参数；不包含组合 shell。", [exact, family, "取消"], { signal });
+          signal?.throwIfAborted();
+          if (selected !== exact && selected !== family) return makeError(operation, "已取消授权。", "blocked");
+          if (selected === family) savedScope = { ...scope, command: { ...scope.command, value: subcommand, match: "subcommand" } };
+        }
+        addRule(projectId, scopeRule(savedScope, "allow", `allowed at ${new Date().toISOString()}`));
       } catch (error) {
         return makeError(operation, error, "blocked");
       }
@@ -478,6 +508,7 @@ async function withConfirmation(
     } catch (error) {
       return makeError(operation, error, "blocked");
     }
+    signal?.throwIfAborted();
     result = await run(authorization);
   }
 
@@ -736,7 +767,7 @@ async function handlePermissionsCommand(argv: string[], ctx: ExtensionContext) {
       rule.identity.alias + " → " + `${rule.identity.user}@${rule.identity.host}:${rule.identity.port}`,
       rule.identity.jump ? `via ${rule.identity.jump.user}@${rule.identity.jump.host}:${rule.identity.jump.port}` : null,
       rule.path ? `${rule.path.value}${rule.path.subtree ? "（子树）" : ""}` : null,
-      rule.command ? `$ ${rule.command.value}` : null,
+      rule.command ? `$ ${rule.command.value}${rule.command.match === "subcommand" ? " *" : ""}` : null,
       rule.command?.cwd ? `cwd=${rule.command.cwd}` : null,
       rule.command?.sudo ? "sudo" : null,
     ].filter(Boolean);
@@ -785,6 +816,7 @@ export default function octsshExtension(pi: ExtensionAPI) {
     command: Type.String({ description: "要在远端执行的 shell 命令" }),
     mode: Type.Optional(Type.Union([Type.Literal("sync"), Type.Literal("async")], { description: "同步等待，或在远端后台异步运行（有 screen 用 screen，否则用 nohup）；默认 sync" })),
     sudo: Type.Optional(Type.Boolean({ description: "是否通过 passwordless sudo 执行" })),
+    timeoutSeconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 3600, description: "同步命令等待秒数，默认 60；长任务用 async" })),
   });
 
   pi.registerTool({
@@ -802,7 +834,8 @@ export default function octsshExtension(pi: ExtensionAPI) {
         const result = await withConfirmation(operation, ctx, projectId(ctx), (authorization: Authorization | undefined) =>
           isAsync
             ? rt.execAsync({ machine: params.machine, command: params.command, sudo: params.sudo, projectId: projectId(ctx), signal, authorization })
-            : rt.exec({ machine: params.machine, command: params.command, sudo: params.sudo, projectId: projectId(ctx), signal, authorization }),
+            : rt.exec({ machine: params.machine, command: params.command, sudo: params.sudo, projectId: projectId(ctx), signal, authorization, timeoutSeconds: params.timeoutSeconds }),
+          signal,
         );
         if (asRecord(result)?.details) return result as ToolResult;
         const record = asRecord(result);
@@ -853,16 +886,16 @@ export default function octsshExtension(pi: ExtensionAPI) {
         const run = (authorization?: Authorization) => {
           if (params.direction === "upload") {
             return params.async
-              ? rt.uploadAsync({ machine: params.machine, localPath: params.localPath, remotePath: params.remotePath, signal, authorization })
-              : rt.upload({ machine: params.machine, localPath: params.localPath, remotePath: params.remotePath, signal, authorization });
+              ? rt.uploadAsync({ machine: params.machine, localPath: params.localPath, remotePath: params.remotePath, projectId: pid, signal, authorization })
+              : rt.upload({ machine: params.machine, localPath: params.localPath, remotePath: params.remotePath, projectId: pid, signal, authorization });
           }
           return params.async
-            ? rt.downloadAsync({ machine: params.machine, localPath: params.localPath, remotePath: params.remotePath, signal })
-            : rt.download({ machine: params.machine, localPath: params.localPath, remotePath: params.remotePath, signal });
+            ? rt.downloadAsync({ machine: params.machine, localPath: params.localPath, remotePath: params.remotePath, projectId: pid, signal, authorization })
+            : rt.download({ machine: params.machine, localPath: params.localPath, remotePath: params.remotePath, projectId: pid, signal, authorization });
         };
         // 上传与下载都可能在远端/本地产生副作用，统一走确认流程：
         // 命中项目 ask 时同样会被问一次（runtime 内部返回 needs_confirmation）。
-        const result = await withConfirmation(operation, ctx, pid, run);
+        const result = await withConfirmation(operation, ctx, pid, run, signal);
         if (asRecord(result)?.details) return result as ToolResult;
         const record = asRecord(result);
         const sessionId = record?.session_id ?? record?.sessionId;
@@ -914,7 +947,7 @@ export default function octsshExtension(pi: ExtensionAPI) {
       "读取远端文本文件。返回整份文件的版本 token（可用于 octssh_edit）、总行数与行窗口；符号链接、非普通文件、非 UTF-8、超过 2 MiB 一律拒绝。",
     promptSnippet: "读取远端文本文件",
     parameters: readSchema,
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
       activeContext = ctx;
       try {
         const rt = getRuntime();
@@ -928,7 +961,9 @@ export default function octsshExtension(pi: ExtensionAPI) {
             limit: params.limit,
             projectId: pid,
             authorization,
+            signal,
           }),
+          signal,
         );
         if (asRecord(result)?.details) return result as ToolResult;
         const record = asRecord(result);
@@ -995,6 +1030,7 @@ export default function octsshExtension(pi: ExtensionAPI) {
             signal,
             authorization,
           }),
+          signal,
         );
         if (asRecord(result)?.details) return result as ToolResult;
         return finishEdit("edit", result);
@@ -1022,32 +1058,34 @@ export default function octsshExtension(pi: ExtensionAPI) {
     description: "管理 OctSSH 异步任务：查询状态与日志、搜索日志、写入 stdin、取消任务。",
     promptSnippet: "查询或管理 OctSSH 远端异步任务",
     parameters: sessionSchema,
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
       activeContext = ctx;
       try {
         const rt = getRuntime();
         let result: unknown;
         switch (params.action) {
           case "get":
-            result = await rt.getSession(params.sessionId, params.lines, projectId(ctx));
+            result = await rt.getSession(params.sessionId, params.lines, projectId(ctx), signal);
             break;
           case "grep":
             if (!params.pattern) return makeError("session-grep", "grep 操作必须提供 pattern");
             result = await rt.grepSession(params.sessionId, params.pattern, {
               maxMatches: params.maxMatches,
               contextLines: params.contextLines,
-            }, projectId(ctx));
+            }, projectId(ctx), signal);
             break;
           case "write-stdin":
             if (params.data === undefined) return makeError("session-write-stdin", "write-stdin 操作必须提供 data");
             // 有副作用：命中项目 ask 时要弹确认，因此走 withConfirmation。
             result = await withConfirmation("session-write-stdin", ctx, projectId(ctx), (authorization?: Authorization) =>
-              rt.writeStdin(params.sessionId, params.data as string, { appendNewline: params.appendNewline }, projectId(ctx), authorization),
+              rt.writeStdin(params.sessionId, params.data as string, { appendNewline: params.appendNewline }, projectId(ctx), authorization, signal),
+              signal,
             );
             break;
           case "cancel":
             result = await withConfirmation("session-cancel", ctx, projectId(ctx), (authorization?: Authorization) =>
-              rt.cancelSession(params.sessionId, params.signal, projectId(ctx), authorization),
+              rt.cancelSession(params.sessionId, params.signal, projectId(ctx), authorization, signal),
+              signal,
             );
             break;
         }
@@ -1070,6 +1108,9 @@ export default function octsshExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     try {
+      sessionApproval.clear();
+      approvalGeneration++;
+      ctx.ui.setStatus("octssh-approval", undefined);
       activeContext = ctx;
       notifyContext = ctx;
       if (runtime) await runtime.shutdown();
@@ -1090,6 +1131,9 @@ export default function octsshExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    sessionApproval.clear();
+    approvalGeneration++;
+    activeContext?.ui.setStatus("octssh-approval", undefined);
     activeContext = null;
     notifyContext = null;
     stopSweepTimer();
@@ -1101,9 +1145,41 @@ export default function octsshExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("octssh", {
     description:
-      "查看 OctSSH 状态；`/octssh trust [forget <host:port>]` 管理主机密钥信任；`/octssh permissions [remove <id>]` 管理本项目规则；`/octssh tasks [wake on|off]` 查看任务并控制自动唤醒；`/octssh credentials clear` 清除内存中的密码/口令",
+      "查看状态；`/octssh allow-all <主机> [on|off]` 本会话免确认；`/octssh trust [forget <host:port>]` 管理主机密钥信任；`/octssh permissions [remove <id>]` 管理本项目规则；`/octssh tasks [wake on|off]` 查看任务并控制自动唤醒；`/octssh credentials clear` 清除内存中的密码/口令",
     handler: async (args, ctx) => {
       const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
+      if (argv[0] === "allow-all") {
+        const pid = projectId(ctx);
+        const machine = argv[1];
+        const action = argv[2] ?? "on";
+        if (!pid || !machine || !["on", "off"].includes(action)) {
+          ctx.ui.notify("用法：/octssh allow-all <主机> [on|off]", "warning");
+          return;
+        }
+        if (action === "off") {
+          sessionApproval.disable(pid, machine);
+        } else {
+          if (!ctx.hasUI || ctx.mode !== "tui") {
+            ctx.ui.notify("请在交互界面开启免确认。", "warning");
+            return;
+          }
+          const generation = approvalGeneration;
+          try {
+            const identity = resolveIdentity(machine);
+            const accepted = await ctx.ui.confirm("开启本会话免确认？",
+              `${projectDisplayPath(ctx.cwd)}\n${displayIdentity(identity)}\n包含删除、覆盖、sudo 等操作。仍保留 deny、硬禁止、主机密钥和版本校验。\n会话结束或重载后失效。`);
+            if (!accepted || generation !== approvalGeneration) return;
+            sessionApproval.enable(pid, identity);
+          } catch (error) {
+            ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+            return;
+          }
+        }
+        const aliases = sessionApproval.aliases(pid);
+        ctx.ui.setStatus("octssh-approval", aliases.length ? `⚠ 本会话免确认：${aliases.join(", ")}` : undefined);
+        ctx.ui.notify(`${machine}：${action === "off" ? "已关闭免确认" : "本项目、本会话免确认已开启"}`, "info");
+        return;
+      }
       if (argv[0] === "trust") {
         await handleTrustCommand(argv.slice(1), ctx);
         return;

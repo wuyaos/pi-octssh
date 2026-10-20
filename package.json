@@ -1,6 +1,6 @@
 {
   "name": "pi-octssh",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Pi 原生 SSH 扩展 — 远程执行、文件传输、异步任务、安全确认(fork from aliyahzombie/OctSSH)",
   "keywords": [
     "pi-package",

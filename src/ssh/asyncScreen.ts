@@ -9,6 +9,7 @@ export type StartAsyncParams = {
   machine: string;
   command: string;
   sudo: boolean;
+  signal?: AbortSignal;
 };
 
 export type StartedAsync = {
@@ -75,10 +76,10 @@ export async function startAsyncInScreen(
   const stdinLogPath = `${remoteDir}/stdin.log`;
 
   // 后端探测：有 screen 用 screen；没有则用 nohup 保活（wrapper 状态机不变）。
-  const hasScreen = await runCommand(client, wrapSh("command -v screen >/dev/null 2>&1"));
+  const hasScreen = await runCommand(client, wrapSh("command -v screen >/dev/null 2>&1"), { signal: params.signal, timeoutMs: 10_000 });
   const backend: "screen" | "nohup" = hasScreen.exitCode === 0 ? "screen" : "nohup";
 
-  const hasMkfifo = await runCommand(client, wrapSh("command -v mkfifo >/dev/null 2>&1"));
+  const hasMkfifo = await runCommand(client, wrapSh("command -v mkfifo >/dev/null 2>&1"), { signal: params.signal, timeoutMs: 10_000 });
   if (hasMkfifo.exitCode !== 0) {
     throw new Error("Remote prerequisite missing: `mkfifo` is required on the server.");
   }
@@ -112,19 +113,18 @@ export async function startAsyncInScreen(
       maxStdoutBytes: 1024,
       maxStderrBytes: 1024,
       pty,
+      signal: params.signal,
+      timeoutMs: 15_000,
     });
 
-  // Prefer no-pty to preserve stderr separation. Retry with pty if needed.
-  let started = await runLauncher(false);
-  if (started.exitCode !== 0) {
-    const combined = `${started.stdout}\n${started.stderr}`.toLowerCase();
-    if (
-      combined.includes('cannot open your terminal') ||
-      combined.includes('no tty') ||
-      combined.includes('not a terminal')
-    ) {
-      started = await runLauncher(true);
-    }
+  // launcher 可能已启动任务；不能因错误文本中出现 tty 就重新执行一次。
+  let started;
+  try {
+    started = await runLauncher(false);
+  } catch (error) {
+    const failure = new Error(`启动结果未确认。请核对 $HOME/${remoteDir}，勿重复启动。session_id=${sessionId}`, { cause: error });
+    failure.name = error instanceof Error ? error.name : "Error";
+    throw failure;
   }
 
   if (started.exitCode !== 0) {
@@ -157,6 +157,8 @@ export async function startAsyncInScreen(
       const diag = await runCommand(client, wrapSh(diagCmd), {
         maxStdoutBytes: 32 * 1024,
         maxStderrBytes: 8 * 1024,
+        signal: params.signal,
+        timeoutMs: 5_000,
       });
       diagOut = diag.stdout || diag.stderr ? `\n${diag.stdout}${diag.stderr}` : '';
     } catch {
@@ -164,7 +166,7 @@ export async function startAsyncInScreen(
     }
 
     throw new Error(
-      `Failed to start remote screen session (session_id=${sessionId}, screen=${screenName}, ${msg || 'unknown error'})${diagOut}`
+      `启动结果未确认，勿重复启动。请核对 $HOME/${remoteDir} (session_id=${sessionId}, screen=${screenName}, ${msg || 'unknown error'})${diagOut}`
     );
   }
 

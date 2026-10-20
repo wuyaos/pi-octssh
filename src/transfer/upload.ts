@@ -27,7 +27,7 @@ export async function planUpload(client: Client, localPath: string, remotePath: 
   if (st.isSymbolicLink()) {
     throw new Error(`Unsupported local path type (symlinks are not allowed): ${localPath}`);
   }
-  const remoteBase = await resolveRemotePath(client, remotePath);
+  const remoteBase = await resolveRemotePath(client, remotePath, signal);
   signal?.throwIfAborted();
 
   if (st.isFile()) {
@@ -79,7 +79,7 @@ export async function findUploadConflicts(client: Client, plan: UploadPlan, sign
       return f.remote;
     });
     return conflicts.filter(Boolean) as string[];
-  });
+  }, signal);
 }
 
 export async function performUpload(
@@ -88,7 +88,7 @@ export async function performUpload(
   signal?: AbortSignal,
   onFileComplete?: (file: UploadPlan["files"][number]) => void,
 ) {
-  const sftp = await getSftp(client);
+  const sftp = await getSftp(client, signal);
   try {
     // Directories are created once per plan. Each file gets its own SFTP
     // channel, because concurrently piping multiple read/write streams through

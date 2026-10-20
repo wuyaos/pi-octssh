@@ -4,13 +4,15 @@ import { wrapSh } from "../ssh/shell.ts";
 
 const homeCache = new WeakMap<object, string>();
 
-async function getRemoteHome(client: Client) {
+async function getRemoteHome(client: Client, signal?: AbortSignal) {
   const cached = homeCache.get(client as any);
   if (cached) return cached;
 
   const res = await runCommand(client, wrapSh('printf %s "$HOME"'), {
     maxStdoutBytes: 4096,
     maxStderrBytes: 4096,
+    signal,
+    timeoutMs: 10_000,
   });
   const home = res.stdout.trim();
   if (!home.startsWith("/")) {
@@ -20,12 +22,12 @@ async function getRemoteHome(client: Client) {
   return home;
 }
 
-export async function resolveRemotePath(client: Client, p: string) {
+export async function resolveRemotePath(client: Client, p: string, signal?: AbortSignal) {
   const raw = p.trim();
   if (!raw) throw new Error("remotePath is empty");
   if (raw.startsWith("/")) return raw;
 
-  const home = await getRemoteHome(client);
+  const home = await getRemoteHome(client, signal);
   if (raw.startsWith("~/")) return `${home}/${raw.slice(2)}`;
   if (raw.startsWith("./")) return `${home}/${raw.slice(2)}`;
   return `${home}/${raw}`;

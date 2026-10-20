@@ -2,7 +2,7 @@
 
 > **Pi 原生 SSH 扩展** — 远程执行、文件传输、异步任务、安全确认。
 
-把 SSH 远程操作能力直接注入 [Pi](https://pi.dev) coding agent。模型通过 4 个原生工具操作你 `~/.ssh/config` 里的主机,本机操作仍用 Pi 内置 `bash`,两者各司其职。
+把 SSH 远程操作能力直接注入 [Pi](https://pi.dev) coding agent。模型通过 6 个原生工具操作 SSH 主机，本机操作仍使用 Pi 内置工具。
 
 ## Fork 来源
 
@@ -59,7 +59,9 @@ octssh_exec({ machine: "minipc", command: "uname -a && df -h" })
 octssh_exec({ machine: "minipc", command: "systemctl restart nginx", sudo: true })
 ```
 
-后台异步任务(长任务在远端 `screen` 中运行,Pi 重启后仍可查询):
+同步命令可用 `timeoutSeconds` 调整等待上限（1–3600 秒，默认 60）。超时或取消后远端可能仍在运行，请先核对，勿重复执行。
+
+后台异步任务（有 screen 用 screen，否则使用 nohup；Pi 重启后仍可查询）：
 
 ```text
 octssh_exec({ machine: "para-GPU-N40", command: "python train.py", mode: "async" })
@@ -90,22 +92,32 @@ octssh_edit({
 
 ## 安全确认
 
-高危操作(递归删除、文件覆盖、远端编辑)通过 Pi 弹窗由用户人工确认,可选四种处理:
+查询命令（如 `uname`、`docker ps`、`docker logs`、`systemctl status` 及明确的防火墙查询）默认放行。危险操作（递归删除、覆盖、编辑、sudo、服务/容器/软件修改等）会弹窗确认。
 
-- **仅本次允许 / 本次拒绝**:只影响当前这一次操作。
-- **此项目始终允许 / 此项目始终禁止**:写入用户侧规则文件,按「项目 + 主机 + 用户 + 操作 + 路径或完整命令」精确匹配,跨会话生效,用 `/octssh permissions` 查看与撤销。
+确认选项：
 
-约束:
+- **允许一次 / 拒绝**：只影响当前操作。
+- **永久允许 / 永久禁止**：写入当前项目的持久规则，可在 `/octssh permissions` 查看和撤销。
+- 支持的简单命令可在选择永久允许后改为子命令范围，例如 `docker restart *`；不支持任意 `docker *`，也不匹配管道、串联、变量替换或目标切换参数。
 
-- 模型**无法**自行提交确认码或修改权限规则(旧版 MCP 的 `confirm_code` 机制已移除);
-- 命中项目禁止即拒绝,且**不建立连接**;命令规则按**完整原串 + 远端 cwd + sudo 条件**匹配,不做前缀授权;
-- 命令规则的匹配对象是**本次调用的完整原串**（外加远端 cwd 与 sudo 条件）：同一命令换个写法——尾随 `/`、加引号、插入空格——**不会**命中该规则。项目规则是精确匹配，不是模式或通配；不要用它来「挡住某类命令」。
-- 规则按**操作族**匹配:一条 `exec` 规则同时约束 `exec-async`(同理 `upload`/`upload-async`、`download`/`download-async`),避免换个工具名就绕开禁止;
-- 规则写 `ask` 时,即使该操作本来不需要确认也会请求确认;作用在 `read`/`edit`/`exec`/`exec-async`/`upload`/`upload-async`/`download`/`download-async`/`session-cancel`/`session-write-stdin` 上。`session-get`/`session-grep` 是纯读取、不改变远端状态,不插入确认步骤,这两项的 `ask` 只作记录用途;
-- 内建硬禁止(如 `iptables -F`)无法被「始终允许」覆盖;
-- 无 UI 时(如 `-p` 程序化模式)默认拒绝,fail closed;已有规则仍然生效;
-- 下载不会覆盖本地已存在文件;上传冲突超过 10 个文件时不提供「始终允许」(范围无法完整预览就不授权);
-- **项目权限不是沙箱**:文件规则只约束插件的文件操作,不构成任意 shell 的文件访问隔离。允许执行命令即代表信任该命令及其引用的脚本。
+会话级免确认：
+
+```text
+/octssh allow-all <主机>
+/octssh allow-all <主机> off
+```
+
+它只绑定当前项目、指定 SSH 真实身份和当前 Pi 会话，结束会话或 `/reload` 后失效。它只免除人工确认，仍保留项目 `deny`、内建硬禁止、主机密钥、文件版本、冲突和能力校验。
+
+约束：
+
+- 模型不能提交确认或修改持久权限规则。
+- 内建硬禁止无法被永久规则或会话免确认覆盖。
+- 包装命令（如 `bash`、`env`、`nohup`、`busybox`）和未知的 `curl/wget` 参数默认要求确认。
+- 项目权限不是 shell 沙箱；允许命令仍意味着信任它及其引用的脚本。
+- 原始请求的项目 deny 在建连前判定；上传目录内各文件的规则在规划后检查。目前传输无规则时仍可能询问，目录上传不提供永久授权，下载不覆盖本地已有文件。
+- 普通模式尊重显式 ask；需要确认而无交互界面时拒绝。会话免确认可代替 ask，但不能绕过 deny。
+- 普通同步命令默认最多等待 60 秒；长任务从首次调用开始使用 `mode: "async"`，超时不自动重试。
 
 ## `/octssh` 命令
 
@@ -117,6 +129,7 @@ octssh_edit({
 |---|---|
 | `/octssh trust [forget <host:port>]` | 查看或删除已信任的主机密钥 |
 | `/octssh permissions [remove <id>]` | 查看或删除当前项目的持久权限规则 |
+| `/octssh allow-all <主机> [on\|off]` | 当前项目、指定主机、本会话免确认；开启需人工确认 |
 | `/octssh credentials clear` | 清除进程内缓存的密码与私钥口令 |
 | `/octssh tasks [wake on\|off]` | 打开任务面板;`wake off` 关闭自动唤醒(仍保留面板记录) |
 
@@ -135,8 +148,8 @@ octssh_edit({
 | 平台 | 同步 exec / SFTP | 异步 screen / sudo |
 |---|---|---|
 | Linux | ✅ | ✅ |
-| macOS | ✅ | ✅(需安装 screen) |
-| FreeBSD | ✅ | ⚠️(需安装 screen) |
+| macOS | ✅ | ✅（screen 或 nohup） |
+| FreeBSD | ✅ | ✅（screen 或 nohup） |
 | Windows OpenSSH | ✅ | ❌(不支持 screen / sudo) |
 
 ## 配置
@@ -181,9 +194,9 @@ octssh_edit({
 - **异步任务分两类**:远端 `screen` 任务在 Pi 退出后继续运行,重启后重新探测;进程内异步传输不承诺继续,重启后归为 `interrupted`,**不自动续传**。
 - **观测不到不等于失败**:网络不通时任务只更新可达性为 `unknown`,不产生完成通知,也不标记失败。
 - **通知不承诺严格 exactly-once**:正常路径按稳定事件 ID 去重;崩溃恢复窗口内可能重复一次,重复项可用同一 ID 识别。
-- **取消不等于已取消**:发出取消请求后进入 `cancelling`,只有确认停止才算 `cancelled`;与自然完成竞争时以实际结果为准。
+- **取消请求不证明进程已停止**：当前控制路径可能先返回 `cancelled`，不能据此证明所有远端子进程已终止；需要重新核对远端状态。
 - **跳过确认不等于跳过校验**:「始终允许」只免除人工确认,主机密钥校验、文件版本校验与能力限制仍然生效。
-- **命令规则是精确匹配**:`rm -rf /data` 的禁止规则挡不住 `rm -rf /data/`、`rm -rf "/data"` 或尾随空格。它约束的是「这一次调用」,不是那类操作。
+- **精确规则与子命令规则分开**：旧的精确规则不会自动扩展；子命令规则必须由用户显式选择。新规则含 `match` 字段，旧版读取器会拒绝；降级前撤销新规则。
 - **`outcome_unknown` 可能留下同目录临时文件**(`.octssh-*`):改名可能已生效,因此既不重试也不保证清理;请自行用 `octssh_read` 核对内容,必要时手动清理残留。
 - **`no_change` 不做远端确认**:当 `oldText === newText` 时工具在建连读文件之前就返回「无变更」,它不代表远端文件就是你以为的样子。
 - **密钥登录是纯配置行为**:私钥只从 `~/.ssh/config` 的 `IdentityFile` 读取,**一台主机只用其中第一把存在的私钥**;插件不弹密钥选择器,也不改配置。多把密钥时,请把该主机要用的那把写在前面的 `IdentityFile` 行。

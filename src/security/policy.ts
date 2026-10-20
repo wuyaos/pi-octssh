@@ -2,6 +2,7 @@ import type { Client } from "ssh2";
 import { runCommand } from "../ssh/runCommand.ts";
 import { wrapSh } from "../ssh/shell.ts";
 import { splitShellWords } from "./shellwords.ts";
+import { commandRisk, firewallQuery, simpleArgv } from "./commandShape.ts";
 
 export type SecurityConfig = {
   denyRegex: string[];
@@ -41,12 +42,14 @@ const BUILTIN_CONFIRM_REGEX: string[] = [
 
 const homeCache = new WeakMap<object, string>();
 
-async function getRemoteHome(client: Client) {
+async function getRemoteHome(client: Client, signal?: AbortSignal) {
   const cached = homeCache.get(client as any);
   if (cached) return cached;
   const res = await runCommand(client, wrapSh('printf %s "$HOME"'), {
     maxStdoutBytes: 4096,
     maxStderrBytes: 4096,
+    signal,
+    timeoutMs: 10_000,
   });
   const home = res.stdout.trim();
   if (!home.startsWith('/')) throw new Error(`Failed to resolve remote $HOME (got: ${home})`);
@@ -150,7 +153,7 @@ async function previewDeletePaths(client: Client, targets: string[], signal?: Ab
   // Bounded preview: collect up to 10001 paths total, then truncate.
   // This avoids remote CPU/disk meltdown on huge trees.
   const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
-  const home = await getRemoteHome(client);
+  const home = await getRemoteHome(client, signal);
   const normalized = targets.map((t) => {
     const raw = t.trim();
     // Expand common home-variable forms so previews work for commands like:
@@ -217,8 +220,9 @@ export async function guardExecCommand(params: {
     };
   }
 
+  const query = firewallQuery(params.command);
   for (const exe of effective.denyExecutables) {
-    if (matchesExecutable(params.command, exe)) {
+    if (matchesExecutable(params.command, exe) && !(query && BUILTIN_DENY_EXECUTABLES.includes(exe) && !params.security.denyExecutables.includes(exe))) {
       return {
         action: "block",
         reason: "blocked_executable",
@@ -236,39 +240,21 @@ export async function guardExecCommand(params: {
     };
   }
 
-  const needConfirm =
-    isRecursiveRm(params.command) ||
-    !!matchesAnyRegex(params.command, effective.requireConfirmRegex);
-  if (!needConfirm) return { action: "allow" };
-
-  if (params.authorized) return { action: "allow" };
-
-  // Only preview rm-based destructive commands.
   const targets = extractRmTargets(params.command) ?? [];
-  if (targets.length === 0) {
-    return {
-      action: "block",
-      reason: "requires_confirm_no_preview",
-      message:
-        "Destructive command requires confirmation but preview is not available for this syntax. Rewrite the command into an explicit `rm -r <path>` form.",
-    };
+  // 硬禁止必须先于一次性授权；授权不能绕过根目录保护。
+  if (isRecursiveRm(params.command) && isClearlyDangerousRootDelete(targets)) {
+    return { action: "block", reason: "root_delete_blocked", message: "禁止删除根文件系统。" };
   }
-  if (isClearlyDangerousRootDelete(targets)) {
-    return {
-      action: "block",
-      reason: "root_delete_blocked",
-      message: "Refusing to run: this appears to delete root filesystem.",
-    };
+  const risk = commandRisk(params.command, params.allowSudo);
+  const configured = matchesAnyRegex(params.command, effective.requireConfirmRegex);
+  if (!risk && !configured) return { action: "allow" };
+  if (params.authorized) return { action: "allow" };
+  if (!isRecursiveRm(params.command) || !simpleArgv(params.command) || targets.length === 0) {
+    return { action: "needs_confirmation", message: risk ?? "配置要求确认。",
+      preview: { type: "command-risk", total: 1, truncated: false, sample: [params.command] } };
   }
-
   const preview = await previewDeletePaths(params.client, targets, params.signal);
 
-  const msg =
-    "DANGEROUS OPERATION DETECTED.\n" +
-    "This command can permanently delete files. OctSSH is running in VIRTUAL MODE and refused to execute it.\n" +
-    `Previewed ${preview.total}${preview.truncated ? "+" : ""} affected paths.\n` +
-    "User confirmation is required before execution.\n" +
-    "Before confirming: enumerate the listed paths and explain WHY each is safe to delete.";
-
+  const msg = `递归删除将影响 ${preview.total}${preview.truncated ? "+" : ""} 个路径，请核对。`;
   return { action: "needs_confirmation", message: msg, preview };
 }

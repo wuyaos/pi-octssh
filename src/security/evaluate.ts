@@ -1,3 +1,4 @@
+import { matchesSubcommand } from "./commandShape.ts";
 import type { SshIdentity } from "./identity.ts";
 import {
   MANAGED_OPERATIONS,
@@ -88,7 +89,9 @@ function commandMatches(rule: ProjectRule, requested: OperationRequest["command"
   if (!requested) return false;
   // 原始完整字符串匹配：不做前缀/通配授权，否则 `git status` 会顺带放行
   // `git status; rm -rf /`。
-  if (rule.command.value !== requested.value) return false;
+  if (rule.command.match === "subcommand") {
+    if (!matchesSubcommand(rule.command.value, requested.value)) return false;
+  } else if (rule.command.value !== requested.value) return false;
   if (rule.command.cwd !== undefined && rule.command.cwd !== requested.cwd) return false;
   if (rule.command.sudo !== undefined && rule.command.sudo !== (requested.sudo ?? false)) return false;
   return true;

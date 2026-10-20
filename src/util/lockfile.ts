@@ -72,17 +72,9 @@ function ownerIsGone(owner: LockOwner): boolean {
   return pidMissing(owner.pid);
 }
 
-function sleepSync(ms: number) {
-  // 同步等待：锁的临界区极短（读-改-写一个 JSON），异步等待会让调用方
-  // 在等待期间继续推进，反而更容易写出竞争代码。
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-export function withLock<T>(lockPath: string, fn: () => T, options: { timeoutMs?: number; pollMs?: number } = {}): T {
-  const timeoutMs = options.timeoutMs ?? 5_000;
-  const pollMs = options.pollMs ?? 50;
-  const deadline = Date.now() + timeoutMs;
-
+/** 同步调用者不能在 Pi 主线程轮询；锁忙立即失败，由上层决定下一轮重试。 */
+export function withLock<T>(lockPath: string, fn: () => T): T {
+  let recoveryAttempted = false;
   fs.mkdirSync(path.dirname(lockPath), { recursive: true });
 
   let fd: number | undefined;
@@ -96,7 +88,8 @@ export function withLock<T>(lockPath: string, fn: () => T, options: { timeoutMs?
 
       const owner = readOwner(lockPath);
 
-      if (owner && ownerIsGone(owner)) {
+      if (!recoveryAttempted && owner && ownerIsGone(owner)) {
+        recoveryAttempted = true;
         // 同机且 pid 已消失：上一持有者崩在临界区里，接管。
         try {
           fs.unlinkSync(lockPath);
@@ -106,13 +99,7 @@ export function withLock<T>(lockPath: string, fn: () => T, options: { timeoutMs?
         continue;
       }
 
-      if (Date.now() >= deadline) {
-        throw new LockBusyError(
-          `Lock is held${owner ? ` by pid ${owner.pid}` : ""}: ${lockPath}`,
-          owner,
-        );
-      }
-      sleepSync(pollMs);
+      throw new LockBusyError("状态正在被另一操作使用，请稍后重试。", owner);
     }
   }
 

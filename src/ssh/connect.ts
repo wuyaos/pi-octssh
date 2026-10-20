@@ -266,6 +266,8 @@ export async function connectSsh2(params: SshClientParams): Promise<Client> {
     resolved.passphrase = passphrase;
   }
 
+  // 凭据 UI 可能晚于连接池取消返回，不能在取消后再建立连接。
+  if (params.signal?.aborted) throw abortError();
   const authHandler = resolved.auth ? buildAuthHandler(resolved, state, resolved.privateKey) : undefined;
 
   return new Promise((resolve, reject) => {
@@ -334,6 +336,7 @@ export async function connectWithProxyJump(params: {
       jumpClient,
       targetHost: params.target.host,
       targetPort: params.target.port ?? 22,
+      signal,
       connectTarget: (sock) => connectSsh2({ ...params.target, sock, signal }),
     });
     return {

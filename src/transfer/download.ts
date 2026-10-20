@@ -43,7 +43,7 @@ export type DownloadPlan = {
 export async function planDownload(client: Client, remotePath: string, localPath: string, signal?: AbortSignal): Promise<DownloadPlan> {
   signal?.throwIfAborted();
   return withSftp(client, async (sftp) => {
-    const remoteAbs = await resolveRemotePath(client, remotePath);
+    const remoteAbs = await resolveRemotePath(client, remotePath, signal);
     signal?.throwIfAborted();
     const stat = await sftpStat(sftp, remoteAbs);
     if (!stat) throw new Error(`Remote path not found: ${remotePath}`);
@@ -91,7 +91,7 @@ export async function planDownload(client: Client, remotePath: string, localPath
     ).sort();
     const totalBytes = files.reduce((acc, f) => acc + (f.size ?? 0), 0);
     return { isDir: true, files, dirs, totalBytes };
-  });
+  }, signal);
 }
 
 export function findDownloadConflicts(plan: DownloadPlan) {
@@ -108,7 +108,7 @@ export async function performDownload(
   signal?: AbortSignal,
   onFileComplete?: (file: DownloadPlan["files"][number]) => void,
 ) {
-  const sftp = await getSftp(client);
+  const sftp = await getSftp(client, signal);
   try {
     for (const d of plan.dirs) {
       signal?.throwIfAborted();

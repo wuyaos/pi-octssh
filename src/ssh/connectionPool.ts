@@ -6,6 +6,7 @@ export type ConnectionLease<T> = {
 export type ConnectionPoolOptions = {
   maxConnections: number;
   idleTtlMs: number;
+  connectTimeoutMs?: number;
 };
 
 function abortError(): Error {
@@ -18,7 +19,10 @@ function waitForAbortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise
   if (!signal) return promise;
   if (signal.aborted) return Promise.reject(abortError());
   return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(abortError());
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason instanceof Error ? signal.reason : abortError());
+    };
     signal.addEventListener("abort", onAbort, { once: true });
     promise.then(
       (value) => { signal.removeEventListener("abort", onAbort); resolve(value); },
@@ -40,6 +44,8 @@ export class ConnectionPool<K, T> {
   private readonly idleTtlMs: number;
   private readonly entries = new Map<K, Entry<T>>();
   private readonly inflight = new Map<K, Promise<Entry<T>>>();
+  private readonly attempts = new Map<K, AbortController>();
+  private readonly connectTimeoutMs: number;
   private closed = false;
 
   constructor(params: {
@@ -51,6 +57,7 @@ export class ConnectionPool<K, T> {
     this.closeFn = params.close;
     this.maxConnections = params.options.maxConnections;
     this.idleTtlMs = params.options.idleTtlMs;
+    this.connectTimeoutMs = params.options.connectTimeoutMs ?? 60_000;
   }
 
   size() {
@@ -65,19 +72,20 @@ export class ConnectionPool<K, T> {
     if (!entry) {
       let pending = this.inflight.get(key);
       if (!pending) {
-        // A connection is shared by every waiter for this key. In particular,
-        // do not pass the first caller's AbortSignal into create(): cancelling
-        // one tool invocation must only stop that invocation's wait, not tear
-        // down the connection other callers are about to use.
-        pending = this.createEntry(key);
+        // 共享创建由池控制；某个调用者取消只退出自己的等待。
+        const controller = new AbortController();
+        this.attempts.set(key, controller);
+        pending = this.createEntry(key, controller);
         this.inflight.set(key, pending);
-        pending.finally(() => this.inflight.delete(key)).catch(() => undefined);
+        const attempt = pending;
+        pending.finally(() => {
+          if (this.inflight.get(key) === attempt) this.inflight.delete(key);
+          if (this.attempts.get(key) === controller) this.attempts.delete(key);
+        }).catch(() => undefined);
       }
       entry = await waitForAbortable(pending, signal);
-      if (this.closed) {
-        if (this.entries.get(key) === entry) this.entries.delete(key);
-        await this.closeFn(entry.value);
-        throw new Error("Connection pool was closed while connecting");
+      if (this.closed || this.entries.get(key) !== entry) {
+        throw new Error("Connection pool was cleared while connecting");
       }
     }
 
@@ -95,17 +103,30 @@ export class ConnectionPool<K, T> {
     };
   }
 
-  private async createEntry(key: K): Promise<Entry<T>> {
-    await this.evictIfNeeded();
-    const value = await this.create(key);
-    const entry: Entry<T> = { value, lastUsedAt: Date.now(), refCount: 0 };
-    const raced = this.entries.get(key);
-    if (raced) {
-      await this.closeFn(value);
-      return raced;
+  private async createEntry(key: K, controller: AbortController): Promise<Entry<T>> {
+    const timeout = setTimeout(() => {
+      const error = new Error("SSH 连接准备超时。");
+      error.name = "TimeoutError";
+      controller.abort(error);
+    }, this.connectTimeoutMs);
+    try {
+      const creation = (async () => {
+        await this.evictIfNeeded();
+        controller.signal.throwIfAborted();
+        const value = await this.create(key, controller.signal);
+        // 工厂不响应取消时，迟到连接只能关闭，不能重新进入已清空的池。
+        if (controller.signal.aborted || this.closed) {
+          await this.closeFn(value);
+          throw controller.signal.reason ?? new Error("Connection pool is closed");
+        }
+        const entry: Entry<T> = { value, lastUsedAt: Date.now(), refCount: 0 };
+        this.entries.set(key, entry);
+        return entry;
+      })();
+      return await waitForAbortable(creation, controller.signal);
+    } finally {
+      clearTimeout(timeout);
     }
-    this.entries.set(key, entry);
-    return entry;
   }
 
   async close(key: K) {
@@ -123,7 +144,7 @@ export class ConnectionPool<K, T> {
 
   async closeAll() {
     this.closed = true;
-    await Promise.allSettled([...this.inflight.values()]);
+    this.abortAttempts();
     const entries = [...this.entries.values()];
     this.entries.clear();
     await Promise.allSettled(entries.map((entry) => Promise.resolve(this.closeFn(entry.value))));
@@ -137,11 +158,18 @@ export class ConnectionPool<K, T> {
    * 之后还要能继续用，因此需要这个。
    */
   async dropAll(): Promise<number> {
-    await Promise.allSettled([...this.inflight.values()]);
+    this.abortAttempts();
     const entries = [...this.entries.values()];
     this.entries.clear();
     await Promise.allSettled(entries.map((entry) => Promise.resolve(this.closeFn(entry.value))));
     return entries.length;
+  }
+
+  private abortAttempts() {
+    const attempts = [...this.attempts.values()];
+    this.attempts.clear();
+    this.inflight.clear();
+    for (const controller of attempts) controller.abort(abortError());
   }
 
   async sweep(now = Date.now()) {

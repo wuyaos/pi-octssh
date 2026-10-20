@@ -17,13 +17,34 @@ export type JumpClientLike = {
   ) => void;
 };
 
-export function promisifyForwardOut(client: JumpClientLike): ForwardOutFn {
+export function promisifyForwardOut(client: JumpClientLike, signal?: AbortSignal): ForwardOutFn {
   return (srcIP, srcPort, dstIP, dstPort) =>
     new Promise((resolve, reject) => {
-      client.forwardOut(srcIP, srcPort, dstIP, dstPort, (err, stream) => {
-        if (err) reject(err);
-        else resolve(stream);
-      });
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener("abort", onAbort);
+        reject(signal?.reason ?? new Error("ProxyJump cancelled"));
+      };
+      if (signal?.aborted) { onAbort(); return; }
+      signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        client.forwardOut(srcIP, srcPort, dstIP, dstPort, (err, stream) => {
+          if (settled) {
+            if (stream) stream.destroy();
+            return;
+          }
+          settled = true;
+          signal?.removeEventListener("abort", onAbort);
+          if (err) reject(err);
+          else resolve(stream);
+        });
+      } catch (error) {
+        settled = true;
+        signal?.removeEventListener("abort", onAbort);
+        reject(error);
+      }
     });
 }
 
@@ -36,6 +57,7 @@ export async function openDirectTcpip(params: {
     // srcIP/srcPort are mostly informational; 127.0.0.1:0 is a common choice.
     return await params.forwardOut("127.0.0.1", 0, params.dstHost, params.dstPort);
   } catch (err: any) {
+    if (err?.name === "AbortError" || err?.name === "TimeoutError") throw err;
     const msg = String(err?.message ?? err);
     // Helpful hint when admins disable TCP forwarding on jump host.
     const hint =
@@ -51,13 +73,20 @@ export async function connectViaProxyJump<T>(params: {
   jumpClient: JumpClientLike;
   targetHost: string;
   targetPort: number;
+  signal?: AbortSignal;
   connectTarget: (sock: Duplex) => Promise<T>;
 }) {
-  const forwardOut = promisifyForwardOut(params.jumpClient);
+  const forwardOut = promisifyForwardOut(params.jumpClient, params.signal);
   const sock = await openDirectTcpip({
     forwardOut,
     dstHost: params.targetHost,
     dstPort: params.targetPort,
   });
-  return params.connectTarget(sock);
+  try {
+    params.signal?.throwIfAborted();
+    return await params.connectTarget(sock);
+  } catch (error) {
+    sock.destroy();
+    throw error;
+  }
 }

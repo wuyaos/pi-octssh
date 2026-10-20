@@ -69,6 +69,7 @@ export const ruleSchema = z
     command: z
       .object({
         value: z.string().min(1),
+        match: z.enum(["exact", "subcommand"]).optional(),
         cwd: z.string().min(1).optional(),
         sudo: z.boolean().optional(),
       })

@@ -26,6 +26,7 @@ export type SweepDeps = {
   /** 该项目的会话是否可用（决定事件是投递还是排队）。 */
   hasSessionForProject?: (projectId: string) => boolean;
   now?: () => string;
+  signal?: AbortSignal;
 };
 
 export type SweepEventResult = {
@@ -72,6 +73,7 @@ export async function runTaskSweep(deps: SweepDeps): Promise<SweepSummary> {
   summary.scanned = records.length;
 
   for (const record of records) {
+    if (deps.signal?.aborted) break;
     let observation: TaskObservation;
     try {
       observation = await deps.observe(record);
@@ -84,6 +86,7 @@ export async function runTaskSweep(deps: SweepDeps): Promise<SweepSummary> {
       continue;
     }
 
+    if (deps.signal?.aborted) break;
     let outcome;
     try {
       outcome = recoverTask({
@@ -126,6 +129,7 @@ export async function runTaskSweep(deps: SweepDeps): Promise<SweepSummary> {
       }
     }
 
+    if (deps.signal?.aborted) break;
     if (outcome.shouldPersist) {
       try {
         deps.store.upsertTask(outcome.record);

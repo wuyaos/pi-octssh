@@ -19,7 +19,7 @@ export type OperationScope = {
   operation: ManagedOperation;
   identity: SshIdentity;
   path?: { value: string; subtree: boolean };
-  command?: { value: string; cwd?: string; sudo?: boolean };
+  command?: { value: string; match?: "exact" | "subcommand"; cwd?: string; sudo?: boolean };
 };
 
 export function execRequest(params: {
@@ -55,6 +55,7 @@ export function execRule(
     identity: identityFields(scope.identity),
     command: {
       value: scope.command.value,
+      ...(scope.command.match ? { match: scope.command.match } : {}),
       ...(scope.command.cwd !== undefined ? { cwd: scope.command.cwd } : {}),
       sudo: scope.command.sudo ?? false,
     },

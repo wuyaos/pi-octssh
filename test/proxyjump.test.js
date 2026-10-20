@@ -37,3 +37,31 @@ test('openDirectTcpip adds a forwarding-disabled hint', async () => {
     /AllowTcpForwarding=no/,
   );
 });
+
+
+test('ProxyJump abort ends forwarding wait and destroys late tunnel', async () => {
+  const { connectViaProxyJump } = await loadTs('ssh/proxyJump.ts');
+  let callback;
+  const abort = new AbortController();
+  const running = connectViaProxyJump({
+    jumpClient: { forwardOut(...args) { callback = args.at(-1); } },
+    targetHost: 'target', targetPort: 22, signal: abort.signal,
+    connectTarget: () => assert.fail('must not connect after abort'),
+  });
+  abort.abort();
+  await assert.rejects(running, { name: 'AbortError' });
+  const late = new PassThrough();
+  callback(null, late);
+  assert.equal(late.destroyed, true);
+});
+
+test('ProxyJump closes tunnel when target handshake fails', async () => {
+  const { connectViaProxyJump } = await loadTs('ssh/proxyJump.ts');
+  const stream = new PassThrough();
+  await assert.rejects(connectViaProxyJump({
+    jumpClient: { forwardOut(...args) { args.at(-1)(null, stream); } },
+    targetHost: 'target', targetPort: 22,
+    connectTarget: async () => { throw new Error('handshake failed'); },
+  }), /handshake failed/);
+  assert.equal(stream.destroyed, true);
+});
