@@ -21,6 +21,7 @@ import { addRule, removeRule, listRules } from "../src/security/rules.ts";
 import { describeScope, scopeRule, type OperationScope } from "../src/security/authorize.ts";
 import { SecretPrompt } from "../src/tui/secretPrompt.ts";
 import { formatDuration, renderDetails } from "../src/tui/toolDisplay.ts";
+import { completeOctsshArguments } from "../src/tui/commandCompletion.ts";
 import {
   clearAllCredentials,
   credentialCacheSize,
@@ -1146,6 +1147,7 @@ export default function octsshExtension(pi: ExtensionAPI) {
   pi.registerCommand("octssh", {
     description:
       "查看状态；`/octssh allow-all <主机> [on|off]` 本会话免确认；`/octssh trust [forget <host:port>]` 管理主机密钥信任；`/octssh permissions [remove <id>]` 管理本项目规则；`/octssh tasks [wake on|off]` 查看任务并控制自动唤醒；`/octssh credentials clear` 清除内存中的密码/口令",
+    getArgumentCompletions: completeOctsshArguments,
     handler: async (args, ctx) => {
       const argv = (args ?? "").trim().split(/\s+/).filter(Boolean);
       if (argv[0] === "allow-all") {
