@@ -21,6 +21,7 @@ import { addRule, removeRule, listRules } from "../src/security/rules.ts";
 import { describeScope, scopeRule, type OperationScope } from "../src/security/authorize.ts";
 import { SecretPrompt } from "../src/tui/secretPrompt.ts";
 import { formatDuration, renderDetails } from "../src/tui/toolDisplay.ts";
+import { selectConfirmation, explainFailure } from "../src/tui/feedback.ts";
 import { completeOctsshArguments } from "../src/tui/commandCompletion.ts";
 import {
   clearAllCredentials,
@@ -363,8 +364,11 @@ function finishEdit(operation: string, result: unknown): ToolResult {
 }
 
 function makeError(operation: string, error: unknown, kind: "blocked" | "error" = "error"): ToolResult {
-  const message = error instanceof Error ? error.message : String(error);
-  return makeResult(operation, { kind, message }, message, kind);
+  const message = explainFailure(operation, error);
+  const reason = error instanceof Error ? error.message : "";
+  // 简短诊断标识用于关联取消来源；自由文本可能含命令或凭据，不回传。
+  const diagnostic = /^[a-z][a-z0-9_-]{0,63}-(?:cancelled|aborted)$/.test(reason) ? reason : undefined;
+  return makeResult(operation, { kind, message, diagnostic }, message, kind);
 }
 
 function confirmationMessage(request: AuthorizationRequest): string {
@@ -448,8 +452,9 @@ async function withConfirmation(
       );
     }
 
-    // select 只接受标题 + 选项，没有正文参数，因此范围说明并入标题。
-    const choice = await ctx.ui.select([`${operation} — OctSSH 安全确认`, "", ...body].join("\n"), options, { signal });
+    const preview = request.preview;
+    const shortBody = [`影响：${preview.total}${preview.truncated ? "（预览截断）" : ""}`, scope?.command?.value ?? preview.sample[0] ?? request.message].join("\n");
+    const choice = await selectConfirmation(ctx, `确认 ${operation} · ${scope?.identity.alias ?? "远端"}`, shortBody, options, signal, body.join("\n"));
     signal?.throwIfAborted();
 
     if (choice === CONFIRM_CHOICES.never) {
@@ -525,9 +530,13 @@ async function withConfirmation(
 }
 
 function finish(operation: string, value: unknown, successSummary: string): ToolResult {
-  const kind = asRecord(value)?.kind;
+  const record = asRecord(value);
+  const kind = record?.kind;
   if (kind === "blocked") return makeResult(operation, value, failureMessage(value), "blocked");
-  if (kind === "error") return makeResult(operation, value, failureMessage(value), "error");
+  if (kind === "error") return makeError(operation, record?.message ?? record?.error ?? record?.reason);
+  if (operation === "exec" && typeof record?.exitCode === "number" && record.exitCode !== 0) {
+    return makeResult(operation, value, `命令退出码 ${record.exitCode}。请检查输出；前序步骤可能已执行，勿盲目重试。`, "error");
+  }
   return makeResult(operation, value, successSummary);
 }
 
@@ -539,8 +548,9 @@ function renderResult(result: ToolResult, expanded: boolean, theme: any) {
     const content = result.content[0];
     return new Text(content?.type === "text" ? content.text : "", 0, 0);
   }
-  const color = details.kind === "success" ? "success" : details.kind === "blocked" ? "warning" : "error";
-  const prefix = details.kind === "success" ? "✓ " : details.kind === "blocked" ? "⚠ " : "✗ ";
+  const hasStderr = details.operation === "exec" && !!asRecord(details.data)?.stderr;
+  const color = details.kind === "success" ? (hasStderr ? "warning" : "success") : details.kind === "blocked" ? "warning" : "error";
+  const prefix = details.kind === "success" ? (hasStderr ? "⚠ " : "✓ ") : details.kind === "blocked" ? "⚠ " : "✗ ";
   const head = theme.fg(color, prefix) + theme.fg("muted", details.summary);
   const body = renderDetails(details.operation, details.data, theme, expanded);
   return new Text(body.length > 0 ? `${head}\n${body.join("\n")}` : head, 0, 0);
@@ -843,7 +853,7 @@ export default function octsshExtension(pi: ExtensionAPI) {
         const sessionId = record?.session_id ?? record?.sessionId;
         const summary = isAsync
           ? `已在 ${params.machine} 启动远端任务${sessionId ? `（${String(sessionId)}）` : ""}`
-          : `${params.machine} 命令执行完成，退出码 ${String(record?.exitCode ?? "未知")}`;
+          : `${params.machine} 命令返回 · 退出码 ${String(record?.exitCode ?? "未知")}${record?.stderr ? " · 含 stderr，请检查" : ""}`;
         return finish(operation, result, summary);
       } catch (error) {
         return makeError(params.mode === "async" ? "exec-async" : "exec", error);
