@@ -67,12 +67,12 @@ let activeContext: ExtensionContext | null = null;
 /**
  * 首次连接未知主机时的人工确认。
  *
- * 只有 TUI 且有 UI 才提供：RPC 转发不了自定义组件；无 UI 场景返回
- * undefined，让 verifier 走 fail-closed 分支。
+ * 使用原生 confirm，TUI 与 RPC 都可承接；无 UI 时返回 undefined，
+ * 让 verifier 走 fail-closed 分支。
  */
 const hostKeyConfirm = (): HostKeyConfirm | undefined => {
   const ctx = activeContext;
-  if (!ctx || !ctx.hasUI || ctx.mode !== "tui") return undefined;
+  if (!ctx || !ctx.hasUI) return undefined;
   return async ({ identity, host, port, algorithm, fingerprintSha256 }) => {
     const message = [
       `主机: ${identity.alias} → ${host}:${port}`,
@@ -417,7 +417,7 @@ async function withConfirmation(
       result = await run(getRuntime().authorize(request));
       continue;
     }
-    if (!ctx.hasUI || ctx.mode !== "tui") {
+    if (!ctx.hasUI) {
       return makeResult(
         operation,
         { kind: "blocked", reason: "confirmation_ui_unavailable" },
@@ -1171,7 +1171,7 @@ export default function octsshExtension(pi: ExtensionAPI) {
         if (action === "off") {
           sessionApproval.disable(pid, machine);
         } else {
-          if (!ctx.hasUI || ctx.mode !== "tui") {
+          if (!ctx.hasUI) {
             ctx.ui.notify("请在交互界面开启免确认。", "warning");
             return;
           }
