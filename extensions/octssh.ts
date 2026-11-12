@@ -144,6 +144,25 @@ const credentialPrompt = (): CredentialPrompt | undefined => {
 let notifyContext: ExtensionContext | null = null;
 /** `sendMessage` 在 ExtensionAPI 上（ctx 上没有），因此要留一个 pi 引用。 */
 let notifyApi: ExtensionAPI | null = null;
+/** 状态桥事件通道：pi-status-bridge 扩展订阅；只含主机别名等元数据，不含秘密。 */
+const STATUS_BRIDGE_CHANNEL = "octssh:approval-changed";
+
+/** 向 Pi 事件总线发布本会话免确认别名快照（best effort，失败静默）。 */
+function emitApprovalChanged(projectId: string | null | undefined) {
+  const api = notifyApi;
+  if (!api) return;
+  try {
+    api.events.emit(STATUS_BRIDGE_CHANNEL, {
+      projectId,
+      aliases: projectId ? sessionApproval.aliases(projectId) : [],
+      generation: approvalGeneration,
+      at: Date.now(),
+    });
+  } catch {
+    // 状态桥失败不影响 SSH 主流程。
+  }
+}
+
 let notifyConfig: { autoWake: boolean; sweepIntervalSeconds: number } = {
   autoWake: true,
   sweepIntervalSeconds: 120,
@@ -1122,6 +1141,7 @@ export default function octsshExtension(pi: ExtensionAPI) {
       sessionApproval.clear();
       approvalGeneration++;
       ctx.ui.setStatus("octssh-approval", undefined);
+      emitApprovalChanged(projectId(ctx));
       activeContext = ctx;
       notifyContext = ctx;
       if (runtime) await runtime.shutdown();
@@ -1132,7 +1152,10 @@ export default function octsshExtension(pi: ExtensionAPI) {
       startSweepTimer();
       runtimeStartedAt = Date.now();
       lastRuntimeError = null;
-      ctx.ui.setStatus("octssh", ctx.ui.theme.fg("accent", "OctSSH"));
+      ctx.ui.setStatus("octssh", ctx.mode === "rpc" ? "OctSSH" : ctx.ui.theme.fg("accent", "OctSSH"));
+      if (ctx.mode === "rpc" && ctx.hasUI) {
+        ctx.ui.notify("OctSSH 已就绪；输入 /octssh 查看连接池、任务和本会话授权状态。", "info");
+      }
     } catch (error) {
       runtime = null;
       runtimeStartedAt = null;
@@ -1144,6 +1167,7 @@ export default function octsshExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     sessionApproval.clear();
     approvalGeneration++;
+    emitApprovalChanged(null);
     activeContext?.ui.setStatus("octssh-approval", undefined);
     activeContext = null;
     notifyContext = null;
@@ -1189,6 +1213,7 @@ export default function octsshExtension(pi: ExtensionAPI) {
         }
         const aliases = sessionApproval.aliases(pid);
         ctx.ui.setStatus("octssh-approval", aliases.length ? `⚠ 本会话免确认：${aliases.join(", ")}` : undefined);
+        emitApprovalChanged(pid);
         ctx.ui.notify(`${machine}：${action === "off" ? "已关闭免确认" : "本项目、本会话免确认已开启"}`, "info");
         return;
       }
@@ -1246,16 +1271,20 @@ export default function octsshExtension(pi: ExtensionAPI) {
       const runningSessions = countRunningSessions();
       const pool = runtime.poolStats();
       const credentials = credentialCacheSize();
-      ctx.ui.notify(
-        [
-          `OctSSH: 运行中 · ${formatDuration(uptimeSeconds)}`,
-          `活跃 session ${runningSessions}`,
-          `连接池 ${pool.connections}/${pool.maxConnections}`,
-          `凭据缓存 ${credentials}`,
-          `自动唤醒 ${loadConfig(getOctsshDir()).taskNotify.autoWake ? "开" : "关"}`,
-        ].join(" · "),
-        "info",
-      );
+      const statusProjectId = projectId(ctx);
+      const status = [
+        `OctSSH: 运行中 · ${formatDuration(uptimeSeconds)}`,
+        `活跃 session ${runningSessions}`,
+        `连接池 ${pool.connections}/${pool.maxConnections}`,
+        `凭据缓存 ${credentials}`,
+        `自动唤醒 ${loadConfig(getOctsshDir()).taskNotify.autoWake ? "开" : "关"}`,
+        `本会话免确认：${(statusProjectId ? sessionApproval.aliases(statusProjectId).join("、") : "") || "未开启"}`,
+      ];
+      if (ctx.mode === "rpc" && ctx.hasUI) {
+        await ctx.ui.select(status.join("\n"), ["关闭"]);
+      } else {
+        ctx.ui.notify(status.join(" · "), "info");
+      }
     },
   });
 }

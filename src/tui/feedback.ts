@@ -9,6 +9,13 @@ function plain(text: string): string {
 export async function selectConfirmation(
   ctx: ExtensionContext, title: string, body: string, choices: string[], signal?: AbortSignal, fullBody = body,
 ): Promise<string | undefined> {
+  // RPC 宿主有自己的布局；不按终端列宽截断安全预览，也不套终端分页。
+  if (ctx.mode === "rpc") {
+    signal?.throwIfAborted();
+    const choice = await ctx.ui.select([plain(title), plain(fullBody)].join("\n\n"), choices, { signal });
+    signal?.throwIfAborted();
+    return choice;
+  }
   const details = "查看详情";
   const source = plain(body);
   while (true) {
